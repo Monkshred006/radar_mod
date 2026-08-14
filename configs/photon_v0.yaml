@@ -1,0 +1,70 @@
+# ==============================================================================
+# PhotonShield AI - Phase V0 Architecture Configuration
+# Staged Mamba -> Diffusion -> PINN -> RL Architecture for Micro-Edge AIoT
+# Target: Arduino Uno Q / MCU Deployment
+# ==============================================================================
+
+dataset:
+  name: radical
+  data_path: null                  # Path to real RaDICaL .npy/.npz dataset directory or file (null for synthetic fallback)
+  sequence_length: 16             # Temporal sequence length T
+  feature_dim: 64                 # Feature vector dimension D per timestep
+  num_classes: 4                  # Number of target classes (0: Empty, 1: Pedestrian, 2: Cyclist, 3: Vehicle)
+  normalization: zscore           # Normalization: zscore, minmax, db, none
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  seed: 42
+
+model:
+  input_dim: 64                   # Input dimension per timestep
+  hidden_dim: 64                  # Hidden dimension H
+  num_layers: 2                   # Number of stacked Mini-Mamba blocks
+  sequence_length: 16             # Expected temporal sequence length
+  num_classes: 4                  # Output classification classes
+  d_state: 16                     # SSM latent state dimension
+  d_conv: 4                       # Causal 1D convolution kernel size
+  expand: 2                       # Inner SSM channel expansion factor
+  dropout: 0.0                    # Dropout probability
+  use_attention: false            # False for V0 minimal path; true for V1/V2 staged extension
+  backend: auto                   # Mamba backend: auto, mamba-ssm, fallback
+
+fusion:
+  fusion_mode: simple             # Simple (V0 default: linear/stack) vs attention (V1/V2)
+
+diffusion:
+  enabled: false                  # Phase V1 preparation: optional latent diffusion denoiser
+  noise_std: 0.1
+  timesteps: 10
+  lambda_diffusion: 0.1
+
+physics:
+  enabled: false                  # Phase V2 preparation: physics-informed loss constraints
+  lambda_physics: 0.1
+  max_acceleration: 2.0
+  max_intensity: 10.0
+
+decision:
+  enabled: false                  # Phase V2 preparation: RL sensor policy controller
+  state_dim: 19
+
+training:
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  epochs: 20
+  lambda_det: 1.0                 # BCE loss weight for detection head
+  lambda_cls: 1.0                 # Cross-Entropy loss weight for classification head
+  lambda_ano: 0.5                 # MSE loss weight for anomaly head
+  lambda_diffusion: 0.1           # Auxiliary diffusion reconstruction loss weight
+  lambda_physics: 0.1             # PINN constraint loss weight
+  seed: 42
+  device: auto                    # auto, cpu, cuda
+  checkpoint_dir: checkpoints/photon_v0
+  results_dir: results/photon_v0
+
+export:
+  onnx: true
+  int8: false
+  ternary: false
+  target_profile: uno_q           # uno_q, stm32_h7, generic_cortex_m4

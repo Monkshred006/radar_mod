@@ -28,8 +28,9 @@ test_checkpoints/
 *.safetensors
 *.onnx
 
-# Generated 3D exports
+# Generated 3D exports and evaluation results
 exports_3d/
+results/
 
 # Large datasets / generated data
 data/
