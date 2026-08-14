@@ -82,11 +82,13 @@ class DiffusionTrainer:
         self.device = device
 
         cfg_train = config.get("training", {})
+        cfg_diff = config.get("diffusion", {})
         self.epochs = int(cfg_train.get("epochs", 50))
         self.lr = float(cfg_train.get("learning_rate", 5e-4))
         self.weight_decay = float(cfg_train.get("weight_decay", 1e-4))
         self.patience = int(cfg_train.get("early_stopping_patience", 10))
         self.use_amp = bool(cfg_train.get("amp", True)) and (device.type == "cuda")
+        self.inference_steps = int(cfg_diff.get("inference_steps", cfg_diff.get("timesteps", 50)))
 
         # Train only the denoiser parameters
         self.optimizer = AdamW(self.model.denoiser.parameters(), lr=self.lr, weight_decay=self.weight_decay)
@@ -99,7 +101,7 @@ class DiffusionTrainer:
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
     def evaluate_epoch(self, dataloader: DataLoader, compute_full_reconstruction: bool = True) -> Dict[str, float]:
-        """Evaluate validation metrics across dataloader."""
+        """Evaluate validation metrics across dataloader using configured inference steps."""
         self.model.denoiser.eval()
 
         total_samples = 0
@@ -113,10 +115,11 @@ class DiffusionTrainer:
                 x = batch["features"].to(self.device)
                 B = x.shape[0]
 
-                # Full conditional reconstruction
+                # Full conditional reconstruction using exact configured inference steps
                 z_hat, z_0, z_c, mask = self.model.reconstruct(
                     x=x,
-                    num_steps=min(20, self.model.timesteps),
+                    num_steps=self.inference_steps,
+                    deterministic=True,
                 )
 
                 corr_metrics = DiffusionLoss.reconstruction_metrics(z_c, z_0, mask)

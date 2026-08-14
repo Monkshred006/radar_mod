@@ -1,7 +1,7 @@
 """DDPM & DDIM Gaussian Diffusion Scheduler for Latent State Denoising & Inpainting.
 
 Handles forward diffusion noising (q-sample), x0 prediction, reverse posterior sampling (p-sample),
-and conditional deterministic DDIM inpainting / data consistency projection.
+and conditional deterministic DDIM / stochastic DDPM inpainting with data consistency.
 """
 
 from __future__ import annotations
@@ -139,16 +139,18 @@ class DDPMScheduler(nn.Module):
             - Recover clean estimate: z0_hat = (z_t - sqrt(1 - alpha_bar_t)*eps_pred) / sqrt(alpha_bar_t).
             - Synthesize next step for missing frames:
               z_{t_prev}^{gen} = sqrt(alpha_bar_{t_prev})*z0_hat + sqrt(1 - alpha_bar_{t_prev})*eps_pred.
-            - Project known frames: z_{t_prev}^{obs} = q(z_c, t_prev).
+            - Project known frames:
+              Deterministic: z_{t_prev}^{obs} = sqrt(alpha_bar_{t_prev}) * condition
+              Stochastic:    z_{t_prev}^{obs} = q(condition, t_prev)
             - Blending: z_{t_prev} = mask * z_{t_prev}^{obs} + (1 - mask) * z_{t_prev}^{gen}.
-            - At final step t=0: z_0 = mask * z_c + (1 - mask) * z0_hat.
+            - At final step t=0: z_0 = mask * condition + (1 - mask) * z0_hat.
 
         Args:
             denoiser: Conditional denoiser network predicting eps_hat.
             condition: Corrupted / observed latent condition z_c [B, T, D].
             mask: Binary observation mask [B, T, 1] (1=observed, 0=missing). Defaults to all 1s.
             num_inference_steps: Steps for reverse trajectory.
-            deterministic: If True, uses deterministic DDIM sampling.
+            deterministic: If True, executes 100% deterministic DDIM reverse sampling with no random noise.
 
         Returns:
             Reconstructed latent tensor z_hat [B, T, D].
@@ -173,10 +175,17 @@ class DDPMScheduler(nn.Module):
 
         # 1. Initialize z_T
         t_start = timesteps[0]
-        init_noise = torch.randn(B, T, D, device=device)
-        t_start_tensor = torch.full((B,), t_start, device=device, dtype=torch.long)
+        sqrt_alpha_start = self.sqrt_alphas_cumprod[t_start]
+        sqrt_one_minus_start = self.sqrt_one_minus_alphas_cumprod[t_start]
 
-        z_t = self.add_noise(condition, init_noise, t_start_tensor)
+        if deterministic:
+            # Deterministic ODE initialization: observed component = sqrt(alpha_bar)*z_c, missing component = 0
+            z_t = (mask * (sqrt_alpha_start * condition)) + ((1.0 - mask) * torch.zeros_like(condition))
+        else:
+            init_noise = torch.randn(B, T, D, device=device)
+            t_start_tensor = torch.full((B,), t_start, device=device, dtype=torch.long)
+            z_t_observed = self.add_noise(condition, init_noise, t_start_tensor)
+            z_t = (mask * z_t_observed) + ((1.0 - mask) * init_noise)
 
         # 2. Reverse Inpainting Trajectory
         for i, t in enumerate(timesteps):
@@ -196,12 +205,16 @@ class DDPMScheduler(nn.Module):
                 sqrt_alpha_prev = self.sqrt_alphas_cumprod[t_prev]
                 sqrt_one_minus_prev = self.sqrt_one_minus_alphas_cumprod[t_prev]
 
+                # Deterministic DDIM trajectory for generated component
                 z_prev_gen = (sqrt_alpha_prev * pred_z0) + (sqrt_one_minus_prev * eps_pred)
-                
-                # Inpainting data-consistency replacement on known frames
-                noise_known = torch.randn(B, T, D, device=device)
-                t_prev_tensor = torch.full((B,), t_prev, device=device, dtype=torch.long)
-                z_prev_known = self.add_noise(condition, noise_known, t_prev_tensor)
+
+                # Observed frame data consistency projection
+                if deterministic:
+                    z_prev_known = sqrt_alpha_prev * condition
+                else:
+                    noise_known = torch.randn(B, T, D, device=device)
+                    t_prev_tensor = torch.full((B,), t_prev, device=device, dtype=torch.long)
+                    z_prev_known = self.add_noise(condition, noise_known, t_prev_tensor)
 
                 z_t = (mask * z_prev_known) + ((1.0 - mask) * z_prev_gen)
             else:

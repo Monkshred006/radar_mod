@@ -157,6 +157,7 @@ class LatentDiffusionModel(nn.Module):
         z_c: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         num_steps: Optional[int] = None,
+        deterministic: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reconstruct clean latent state z_hat from input with data consistency.
 
@@ -165,6 +166,7 @@ class LatentDiffusionModel(nn.Module):
             z_c: Optional pre-corrupted latent tensor [B, T, 64].
             mask: Optional observation mask [B, T, 1].
             num_steps: Denoising steps.
+            deterministic: If True, executes deterministic DDIM inpainting.
 
         Returns:
             Tuple of (z_hat, z_0, z_c, mask).
@@ -178,6 +180,7 @@ class LatentDiffusionModel(nn.Module):
             condition=z_c,
             mask=mask,
             num_inference_steps=num_steps or self.timesteps,
+            deterministic=deterministic,
         )
 
         return z_hat, z_0, z_c, mask

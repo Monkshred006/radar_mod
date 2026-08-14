@@ -64,8 +64,12 @@ class DiffusionEvaluator:
                 x = batch["features"].to(self.device)
                 B = x.shape[0]
 
-                # Run reverse diffusion reconstruction with data-consistency inpainting
-                z_hat, z_0, z_c, mask = self.model.reconstruct(x=x, num_steps=num_inference_steps)
+                # Run reverse diffusion reconstruction with deterministic data-consistency inpainting
+                z_hat, z_0, z_c, mask = self.model.reconstruct(
+                    x=x,
+                    num_steps=num_inference_steps,
+                    deterministic=True,
+                )
 
                 corr_metrics = DiffusionLoss.reconstruction_metrics(z_c, z_0, mask)
                 rec_metrics = DiffusionLoss.reconstruction_metrics(z_hat, z_0, mask)

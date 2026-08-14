@@ -146,3 +146,25 @@ class TestDiffusionSanity:
 
         metrics = DiffusionLoss.reconstruction_metrics(z_hat, z0, mask)
         assert metrics["observed_mse"] < 1e-6, f"Observed MSE drifted: {metrics['observed_mse']}"
+
+    def test_deterministic_sampling_reproducibility(self, scheduler, denoiser):
+        """Verify deterministic=True produces 100% identical outputs and stochastic mode can vary."""
+        B, T, D = 2, 16, 64
+        z0 = torch.randn(B, T, D)
+        mask = torch.ones(B, T, 1)
+        mask[:, 4:8, :] = 0.0
+        zc = z0 * mask
+
+        # Run deterministic reconstruction twice
+        out1_det = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=True)
+        out2_det = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=True)
+
+        assert torch.allclose(out1_det, out2_det, atol=1e-7), "Deterministic reconstruction produced non-identical outputs!"
+
+        # Run stochastic reconstruction twice
+        out1_stoch = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=False)
+        out2_stoch = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=False)
+
+        # Missing frames in stochastic mode should have different random initializations/perturbations
+        diff_stoch = torch.max(torch.abs(out1_stoch - out2_stoch)).item()
+        assert diff_stoch > 0.0, "Stochastic reconstruction did not vary!"
