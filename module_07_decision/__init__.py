@@ -12,6 +12,10 @@ from module_07_decision.thresholds import analyze_validation_thresholds
 from module_07_decision.calibration import TemperatureScaler
 from module_07_decision.checkpointing import save_decision_checkpoint, load_decision_checkpoint
 from module_07_decision.inference import PhotonShieldDecisionPipeline
+from module_07_decision.state_builder import DecisionStateBuilder
+from module_07_decision.reward import SensorControlReward
+from module_07_decision.policy_network import SensorPolicyNetwork
+from module_07_decision.sensor_controller import SensorController
 
 __all__ = [
     "DecisionModelConfig",
@@ -29,4 +33,8 @@ __all__ = [
     "save_decision_checkpoint",
     "load_decision_checkpoint",
     "PhotonShieldDecisionPipeline",
+    "DecisionStateBuilder",
+    "SensorControlReward",
+    "SensorPolicyNetwork",
+    "SensorController",
 ]
