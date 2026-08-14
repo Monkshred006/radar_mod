@@ -1,22 +1,20 @@
 """Radar-Specific Latent State Corruption Operators for PhotonShield AI V1.
 
-Provides controlled degradation operators on temporal latent representations [B, T, D]:
-1. Gaussian Noise
-2. Temporal Frame Dropout (Primary for V1.0)
-3. Temporal Gaps (Contiguous missing sequence chunks)
-4. Amplitude Scaling (Intermittent attenuation)
-5. Random Frame Masking
+Provides controlled degradation operators on temporal latent representations [B, T, D]
+and returns both the corrupted latent `z_c` and explicit binary observation mask `mask`:
+- `mask = 1`: observed / valid frame
+- `mask = 0`: corrupted / missing frame
 """
 
 from __future__ import annotations
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import torch
 import torch.nn as nn
 
 
 class RadarLatentCorruption(nn.Module):
-    """Applies controlled corruption to latent radar state tensors [B, T, D]."""
+    """Applies controlled corruption to latent radar state tensors [B, T, D] and returns (z_c, mask)."""
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         super().__init__()
@@ -49,67 +47,91 @@ class RadarLatentCorruption(nn.Module):
         self.rm_enabled = cfg_rm.get("enabled", False)
         self.rm_ratio = float(cfg_rm.get("mask_ratio", 0.25))
 
-    def apply_frame_dropout(self, z: torch.Tensor) -> torch.Tensor:
+    def apply_frame_dropout(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Randomly drop (zero out) individual frames along sequence length T with probability `p`."""
-        if not self.fd_enabled or self.fd_prob <= 0:
-            return z
-
         B, T, D = z.shape
-        # Create mask of shape [B, T, 1]
+        if not self.fd_enabled or self.fd_prob <= 0:
+            return z, torch.ones(B, T, 1, device=z.device)
+
+        # Mask of shape [B, T, 1] with 1 for observed, 0 for dropped
         mask = (torch.rand(B, T, 1, device=z.device) >= self.fd_prob).float()
-        
+
         # Ensure at least 1 frame remains uncorrupted to maintain signal anchors
         all_zero = (mask.sum(dim=1, keepdim=True) == 0)
         if all_zero.any():
-            mask[:, 0, :] = 1.0
+            for b in range(B):
+                if all_zero[b, 0, 0]:
+                    mask[b, 0, :] = 1.0
 
-        return z * mask
+        z_c = z * mask
+        return z_c, mask
 
-    def apply_gaussian_noise(self, z: torch.Tensor) -> torch.Tensor:
+    def apply_gaussian_noise(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Add zero-mean Gaussian noise with standard deviation sigma."""
-        if not self.gn_enabled or self.gn_sigma <= 0:
-            return z
-        noise = torch.randn_like(z) * self.gn_sigma
-        return z + noise
-
-    def apply_temporal_gap(self, z: torch.Tensor) -> torch.Tensor:
-        """Zero out a contiguous chunk of length `gap_length`."""
-        if not self.tg_enabled or self.tg_length <= 0:
-            return z
-
         B, T, D = z.shape
+        if not self.gn_enabled or self.gn_sigma <= 0:
+            return z, torch.ones(B, T, 1, device=z.device)
+        noise = torch.randn_like(z) * self.gn_sigma
+        # Noisy frames are considered partially observed/corrupted (mask=0)
+        mask = torch.zeros(B, T, 1, device=z.device)
+        return z + noise, mask
+
+    def apply_temporal_gap(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Zero out a contiguous chunk of length `gap_length`."""
+        B, T, D = z.shape
+        mask = torch.ones(B, T, 1, device=z.device)
+        if not self.tg_enabled or self.tg_length <= 0:
+            return z, mask
+
         z_corrupted = z.clone()
         gap_len = min(self.tg_length, T - 1)
-        
+
         for b in range(B):
             start = torch.randint(0, T - gap_len + 1, (1,)).item()
             z_corrupted[b, start : start + gap_len, :] = 0.0
-            
-        return z_corrupted
+            mask[b, start : start + gap_len, :] = 0.0
 
-    def apply_amplitude_scaling(self, z: torch.Tensor) -> torch.Tensor:
+        return z_corrupted, mask
+
+    def apply_amplitude_scaling(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply random scale factor per sequence."""
-        if not self.as_enabled:
-            return z
         B, T, D = z.shape
+        if not self.as_enabled:
+            return z, torch.ones(B, T, 1, device=z.device)
         scales = (torch.rand(B, 1, 1, device=z.device) * (self.as_max - self.as_min)) + self.as_min
-        return z * scales
+        mask = torch.zeros(B, T, 1, device=z.device)
+        return z * scales, mask
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """Corrupt input latent tensor z [B, T, D]."""
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Corrupt input latent tensor z [B, T, D].
+
+        Returns:
+            Tuple of:
+                - z_c: [B, T, D] corrupted latent tensor
+                - mask: [B, T, 1] binary observation mask (1=observed, 0=corrupted)
+        """
+        B, T, D = z.shape
         if not self.enabled:
-            return z
+            return z, torch.ones(B, T, 1, device=z.device)
 
         z_c = z.clone()
+        mask = torch.ones(B, T, 1, device=z.device)
 
-        # Apply active corruptions
+        # Apply active corruptions sequentially, combining masks
         if self.fd_enabled:
-            z_c = self.apply_frame_dropout(z_c)
-        if self.gn_enabled:
-            z_c = self.apply_gaussian_noise(z_c)
-        if self.tg_enabled:
-            z_c = self.apply_temporal_gap(z_c)
-        if self.as_enabled:
-            z_c = self.apply_amplitude_scaling(z_c)
+            z_c, m_fd = self.apply_frame_dropout(z_c)
+            mask = mask * m_fd
 
-        return z_c
+        if self.tg_enabled:
+            z_c, m_tg = self.apply_temporal_gap(z_c)
+            mask = mask * m_tg
+
+        if self.gn_enabled:
+            z_c, m_gn = self.apply_gaussian_noise(z_c)
+            mask = mask * m_gn
+
+        if self.as_enabled:
+            z_c, m_as = self.apply_amplitude_scaling(z_c)
+            mask = mask * m_as
+
+        return z_c, mask
