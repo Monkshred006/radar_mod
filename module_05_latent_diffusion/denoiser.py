@@ -1,6 +1,7 @@
 """Lightweight Temporal Denoiser for Conditional Radar Latent Diffusion.
 
-Compact 2-block temporal architecture conditioning on corrupted latent state z_c and diffusion timestep t.
+Compact 2-block temporal architecture conditioning on noisy latent z_t, corrupted latent condition z_c,
+observation mask [B, T, 1], and diffusion timestep t.
 """
 
 from __future__ import annotations
@@ -94,9 +95,9 @@ class LightweightDenoiser(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # 2. Input Projection (Concatenates z_t and z_c: 64 + 64 = 128)
+        # 2. Input Projection: Concatenates z_t [64], z_c [64], and mask [1] = 129 dims
         self.input_proj = nn.Sequential(
-            nn.Linear(latent_dim * 2, hidden_dim),
+            nn.Linear(latent_dim * 2 + 1, hidden_dim),
             nn.SiLU(),
         )
 
@@ -121,22 +122,32 @@ class LightweightDenoiser(nn.Module):
         z_t: torch.Tensor,
         condition: torch.Tensor,
         timestep: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Predict noise epsilon from noisy latent z_t, condition z_c, and timestep t.
+        """Predict noise epsilon from noisy latent z_t, condition z_c, observation mask, and timestep t.
 
         Args:
             z_t: Noisy latent tensor [B, T, latent_dim=64].
             condition: Corrupted latent condition z_c [B, T, latent_dim=64].
             timestep: Timestep tensor [B] (integer in 0..T_max-1).
+            mask: Optional observation mask [B, T, 1] (1=observed, 0=missing). Defaults to ones.
 
         Returns:
             Predicted noise tensor epsilon_hat [B, T, latent_dim=64].
         """
+        B, T, _ = z_t.shape
+        device = z_t.device
+
+        if mask is None:
+            mask = torch.ones(B, T, 1, device=device)
+        elif mask.ndim == 2:
+            mask = mask.unsqueeze(-1)
+
         # Embed timestep
         t_emb = self.time_mlp(timestep)  # [B, hidden_dim]
 
-        # Concatenate noisy latent and corrupted condition
-        x = torch.cat([z_t, condition], dim=-1)  # [B, T, 128]
+        # Concatenate noisy latent, corrupted condition, and observation mask
+        x = torch.cat([z_t, condition, mask], dim=-1)  # [B, T, 129]
         h = self.input_proj(x)
 
         # Process through temporal blocks
