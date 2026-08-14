@@ -6,11 +6,12 @@
 
 dataset:
   name: radical
-  data_path: null                  # Path to real RaDICaL .npy/.npz dataset directory or file (null for synthetic fallback)
+  data_path: data/radical          # Official RaDICaL dataset directory (train/, val/, test/, metadata/, labels/)
+  synthetic_fallback: false        # Hard requirement for real dataset (synthetic fallback disabled)
   sequence_length: 16             # Temporal sequence length T
   feature_dim: 64                 # Feature vector dimension D per timestep
   num_classes: 4                  # Number of target classes (0: Empty, 1: Pedestrian, 2: Cyclist, 3: Vehicle)
-  normalization: zscore           # Normalization: zscore, minmax, db, none
+  normalization: db               # Logarithmic dB power spectral normalization
   train_ratio: 0.70
   val_ratio: 0.15
   test_ratio: 0.15
@@ -26,26 +27,26 @@ model:
   d_conv: 4                       # Causal 1D convolution kernel size
   expand: 2                       # Inner SSM channel expansion factor
   dropout: 0.0                    # Dropout probability
-  use_attention: false            # False for V0 minimal path; true for V1/V2 staged extension
+  use_attention: false            # False for V0 minimal path (strictly disabled in baseline)
   backend: auto                   # Mamba backend: auto, mamba-ssm, fallback
 
 fusion:
   fusion_mode: simple             # Simple (V0 default: linear/stack) vs attention (V1/V2)
 
 diffusion:
-  enabled: false                  # Phase V1 preparation: optional latent diffusion denoiser
+  enabled: false                  # Phase V1 preparation: disabled for V0 baseline
   noise_std: 0.1
   timesteps: 10
   lambda_diffusion: 0.1
 
 physics:
-  enabled: false                  # Phase V2 preparation: physics-informed loss constraints
+  enabled: false                  # Phase V2 preparation: disabled for V0 baseline
   lambda_physics: 0.1
   max_acceleration: 2.0
   max_intensity: 10.0
 
 decision:
-  enabled: false                  # Phase V2 preparation: RL sensor policy controller
+  enabled: false                  # Phase V2 preparation: disabled for V0 baseline
   state_dim: 19
 
 training:

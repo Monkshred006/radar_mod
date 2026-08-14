@@ -7,7 +7,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Optional, Union, Dict, Any
+import sys
+from typing import Optional, Union, Dict, Any, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import torch
 import torch.nn as nn
 
@@ -116,13 +122,24 @@ def export_photon_v0_onnx(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export PhotonV0 to ONNX format.")
-    parser.add_argument("--model-path", type=str, default=None, help="Path to .pt checkpoint")
-    parser.add_argument("--output", type=str, default="results/photon_v0/photon_v0.onnx", help="Output path")
+    parser.add_argument("--model-path", "--checkpoint", dest="model_path", type=str, default=None, help="Path to .pt checkpoint")
+    parser.add_argument("--config", type=str, default="configs/photon_v0.yaml", help="Path to config yaml")
+    parser.add_argument("--output", type=str, default="artifacts/photon_v0.onnx", help="Output ONNX path")
     parser.add_argument("--input-dim", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--num-classes", type=int, default=4)
     args = parser.parse_args()
+
+    # Load config overrides if available
+    if args.config and Path(args.config).exists():
+        import yaml
+        with open(args.config, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+            args.input_dim = cfg.get("model", {}).get("input_dim", args.input_dim)
+            args.hidden_dim = cfg.get("model", {}).get("hidden_dim", args.hidden_dim)
+            args.seq_len = cfg.get("model", {}).get("sequence_length", args.seq_len)
+            args.num_classes = cfg.get("model", {}).get("num_classes", args.num_classes)
 
     model = PhotonV0(
         input_dim=args.input_dim,
@@ -130,6 +147,7 @@ def main() -> None:
         num_layers=2,
         sequence_length=args.seq_len,
         num_classes=args.num_classes,
+        backend="fallback",
     )
     if args.model_path and Path(args.model_path).exists():
         state_dict = torch.load(args.model_path, map_location="cpu")

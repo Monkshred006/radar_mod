@@ -3,12 +3,13 @@
 Computes:
 1. Confusion Matrix & Per-Class Precision / Recall / F1.
 2. ROC Curve & Detection AUROC.
-3. Latency Benchmarking (mean, std, p95, p99 per sample in ms).
-4. Memory Footprint Benchmarking (peak RAM / allocation).
-5. Saves all evaluation artifacts to `results/photon_v0/`.
+3. Generates and saves visual plots: `confusion_matrix.png` & `roc_curve.png`.
+4. Latency Benchmarking (mean, std, p95, p99 per sample in ms on CPU & CUDA if available).
+5. Memory Footprint Benchmarking (peak RAM / allocation).
+6. Saves all evaluation artifacts to `results/photon_v0/`.
 
 Usage:
-    python evaluate_photon_v0.py --config configs/photon_v0.yaml --checkpoint checkpoints/photon_v0/photon_v0_best.pt
+    python evaluate_photon_v0.py --config configs/photon_v0.yaml --checkpoint checkpoints/photon_v0/best_model.pt
 """
 
 from __future__ import annotations
@@ -17,17 +18,26 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
 import time
-from typing import Dict, Any, List, Tuple
-import yaml
+from typing import Dict, Any, List, Tuple, Optional
 
+# Ensure repository root is in python path
+REPO_ROOT = Path(__file__).resolve().parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 
 from module_04_mamba_hybrid.photon_v0 import PhotonV0, count_parameters
-from module_03_sensor_fusion.radical_adapter import RaDICaLDatasetAdapter
+from module_03_sensor_fusion.radical_adapter import RaDICaLDatasetAdapter, RADICAL_CLASSES
 from module_06_bitnet.profile_uno_q import profile_for_uno_q
 
 
@@ -40,8 +50,42 @@ def compute_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, num_classes
     return cm
 
 
-def compute_roc_curve(y_true: np.ndarray, y_score: np.ndarray, num_thresholds: int = 100) -> Tuple[List[float], List[float], List[float], float]:
-    """Compute True Positive Rate (TPR), False Positive Rate (FPR) across thresholds, and AUROC."""
+def plot_confusion_matrix(cm: np.ndarray, class_names: List[str], output_path: Union[str, Path]) -> None:
+    """Render and save confusion matrix heatmap."""
+    fig, ax = plt.subplots(figsize=(7, 6))
+    fig.patch.set_facecolor("#ffffff")
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+
+    ax.set(
+        xticks=np.arange(cm.shape[1]),
+        yticks=np.arange(cm.shape[0]),
+        xticklabels=class_names,
+        yticklabels=class_names,
+        title="RaDICaL Target Classification Confusion Matrix",
+        ylabel="True Class",
+        xlabel="Predicted Class",
+    )
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 1.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(
+                j, i, format(cm[i, j], "d"),
+                ha="center", va="center",
+                color="white" if cm[i, j] > thresh else "black",
+                fontsize=11, fontweight="bold",
+            )
+    fig.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+
+def compute_roc_curve(
+    y_true: np.ndarray, y_score: np.ndarray, num_thresholds: int = 100
+) -> Tuple[List[float], List[float], List[float], float]:
+    """Compute True Positive Rate (TPR), False Positive Rate (FPR), and AUROC."""
     thresholds = np.linspace(0.0, 1.0, num_thresholds)
     tpr_list = []
     fpr_list = []
@@ -69,6 +113,23 @@ def compute_roc_curve(y_true: np.ndarray, y_score: np.ndarray, num_thresholds: i
     return fpr_list, tpr_list, thresholds.tolist(), auroc
 
 
+def plot_roc_curve(fpr: List[float], tpr: List[float], auroc: float, output_path: Union[str, Path]) -> None:
+    """Render and save Receiver Operating Characteristic (ROC) curve."""
+    plt.figure(figsize=(7, 6))
+    plt.plot(fpr, tpr, color="#1f77b4", lw=2.5, label=f"PhotonV0 ROC (AUROC = {auroc:.4f})")
+    plt.plot([0, 1], [0, 1], color="#7f7f7f", lw=1.5, linestyle="--", label="Random Guess (AUROC = 0.50)")
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel("False Positive Rate (1 - Specificity)", fontsize=11)
+    plt.ylabel("True Positive Rate (Sensitivity)", fontsize=11)
+    plt.title("RaDICaL Target Detection ROC Curve", fontsize=12, fontweight="bold")
+    plt.legend(loc="lower right", fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+
 def benchmark_latency_and_memory(
     model: PhotonV0,
     sequence_length: int = 16,
@@ -77,7 +138,7 @@ def benchmark_latency_and_memory(
     num_runs: int = 100,
     warmup: int = 10,
 ) -> Dict[str, float]:
-    """Benchmark forward pass latency and peak memory."""
+    """Benchmark forward pass latency."""
     model.eval()
     model.to(device)
     dummy_single = torch.randn(1, sequence_length, input_dim, device=device)
@@ -87,11 +148,16 @@ def benchmark_latency_and_memory(
         for _ in range(warmup):
             _ = model(dummy_single)
 
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
     latencies_ms = []
     with torch.no_grad():
         for _ in range(num_runs):
             t0 = time.perf_counter()
             _ = model(dummy_single)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
             t1 = time.perf_counter()
             latencies_ms.append((t1 - t0) * 1000.0)
 
@@ -104,12 +170,13 @@ def benchmark_latency_and_memory(
     fps = 1000.0 / mean_lat if mean_lat > 0 else 0.0
 
     return {
-        "latency_mean_ms": mean_lat,
-        "latency_std_ms": std_lat,
-        "latency_p50_ms": p50_lat,
-        "latency_p95_ms": p95_lat,
-        "latency_p99_ms": p99_lat,
-        "throughput_fps": fps,
+        "device": str(device),
+        "latency_mean_ms": round(mean_lat, 3),
+        "latency_std_ms": round(std_lat, 3),
+        "latency_p50_ms": round(p50_lat, 3),
+        "latency_p95_ms": round(p95_lat, 3),
+        "latency_p99_ms": round(p99_lat, 3),
+        "throughput_fps": round(fps, 1),
     }
 
 
@@ -117,6 +184,7 @@ def evaluate_photon_v0(
     config: Dict[str, Any],
     checkpoint_path: Optional[str] = None,
     output_dir: str = "results/photon_v0",
+    allow_synthetic: bool = False,
 ) -> Dict[str, Any]:
     """Execute complete evaluation workflow."""
     cfg_data = config.get("dataset", {})
@@ -132,20 +200,22 @@ def evaluate_photon_v0(
     out_path.mkdir(parents=True, exist_ok=True)
 
     # 1. Dataset Adapter
+    synthetic_fallback = allow_synthetic or cfg_data.get("synthetic_fallback", False)
     adapter = RaDICaLDatasetAdapter(
-        data_path=cfg_data.get("data_path"),
+        data_path=cfg_data.get("data_path", "data/radical"),
         sequence_length=cfg_data.get("sequence_length", 16),
         feature_dim=cfg_data.get("feature_dim", 64),
-        num_classes=cfg_data.get("num_classes", 4),
-        normalization=cfg_data.get("normalization", "zscore"),
+        num_classes=cfg_model.get("num_classes", 4),
+        normalization=cfg_data.get("normalization", "db"),
         train_ratio=cfg_data.get("train_ratio", 0.70),
         val_ratio=cfg_data.get("val_ratio", 0.15),
         test_ratio=cfg_data.get("test_ratio", 0.15),
         seed=seed,
+        synthetic_fallback=synthetic_fallback,
     )
 
     _, _, test_loader = adapter.get_dataloaders(
-        batch_size=cfg_train.get("batch_size", 64), num_synthetic_fallback=300
+        batch_size=cfg_train.get("batch_size", 64), num_synthetic_fallback=500
     )
 
     # 2. Build Model
@@ -162,12 +232,16 @@ def evaluate_photon_v0(
         backend=cfg_model.get("backend", "auto"),
     ).to(device)
 
-    ckpt = checkpoint_path or (Path(cfg_train.get("checkpoint_dir", "checkpoints/photon_v0")) / "photon_v0_best.pt")
-    if Path(ckpt).exists():
-        model.load_state_dict(torch.load(ckpt, map_location=device))
-        print(f"[PhotonShield AI] Loaded weights from {ckpt}")
+    ckpt_candidate = (
+        checkpoint_path
+        or (Path(cfg_train.get("checkpoint_dir", "checkpoints/photon_v0")) / "best_model.pt")
+        or (Path(cfg_train.get("checkpoint_dir", "checkpoints/photon_v0")) / "photon_v0_best.pt")
+    )
+    if Path(ckpt_candidate).exists():
+        model.load_state_dict(torch.load(ckpt_candidate, map_location=device))
+        print(f"[PhotonShield AI] Loaded weights from {ckpt_candidate}")
     else:
-        print(f"[PhotonShield AI] Checkpoint {ckpt} not found. Evaluating with initialized model.")
+        print(f"[PhotonShield AI] Checkpoint {ckpt_candidate} not found. Evaluating with initialized model.")
 
     model.eval()
 
@@ -201,6 +275,7 @@ def evaluate_photon_v0(
     # Confusion Matrix
     num_classes = cfg_model.get("num_classes", 4)
     cm = compute_confusion_matrix(all_cls_t, all_cls_p, num_classes=num_classes)
+    plot_confusion_matrix(cm, RADICAL_CLASSES[:num_classes], out_path / "confusion_matrix.png")
 
     # Precision, Recall, F1 per class
     per_class_metrics = {}
@@ -213,10 +288,11 @@ def evaluate_photon_v0(
         rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
         f1_list.append(f1)
-        per_class_metrics[f"class_{c}"] = {
-            "precision": float(prec),
-            "recall": float(rec),
-            "f1": float(f1),
+        c_name = RADICAL_CLASSES[c] if c < len(RADICAL_CLASSES) else f"class_{c}"
+        per_class_metrics[c_name] = {
+            "precision": float(round(prec, 4)),
+            "recall": float(round(rec, 4)),
+            "f1": float(round(f1, 4)),
             "support": int(np.sum(cm[c, :])),
         }
 
@@ -226,14 +302,25 @@ def evaluate_photon_v0(
 
     # ROC & AUROC
     fpr_list, tpr_list, thresholds, auroc = compute_roc_curve(all_det_t, all_det_p)
+    plot_roc_curve(fpr_list, tpr_list, auroc, out_path / "roc_curve.png")
 
-    # Latency & Memory Benchmark
-    benchmark_stats = benchmark_latency_and_memory(
+    # Latency Benchmark on CPU
+    cpu_latency = benchmark_latency_and_memory(
         model=model,
         sequence_length=cfg_model.get("sequence_length", 16),
         input_dim=cfg_model.get("input_dim", 64),
-        device=device,
+        device=torch.device("cpu"),
     )
+
+    # Latency Benchmark on CUDA if available
+    cuda_latency = None
+    if torch.cuda.is_available():
+        cuda_latency = benchmark_latency_and_memory(
+            model=model,
+            sequence_length=cfg_model.get("sequence_length", 16),
+            input_dim=cfg_model.get("input_dim", 64),
+            device=torch.device("cuda"),
+        )
 
     # Hardware profile for Uno Q
     hw_profile = profile_for_uno_q(
@@ -243,18 +330,19 @@ def evaluate_photon_v0(
     )
 
     results = {
-        "accuracy": accuracy,
-        "macro_f1": macro_f1,
-        "anomaly_mae": ano_mae,
-        "detection_auroc": auroc,
+        "accuracy": round(accuracy, 4),
+        "macro_f1": round(macro_f1, 4),
+        "anomaly_mae": round(ano_mae, 4),
+        "detection_auroc": round(auroc, 4),
         "confusion_matrix": cm.tolist(),
         "per_class_metrics": per_class_metrics,
         "roc_curve": {
-            "fpr": fpr_list,
-            "tpr": tpr_list,
-            "thresholds": thresholds,
+            "fpr": [round(x, 4) for x in fpr_list],
+            "tpr": [round(x, 4) for x in tpr_list],
+            "thresholds": [round(x, 4) for x in thresholds],
         },
-        "latency_benchmark": benchmark_stats,
+        "latency_benchmark_cpu": cpu_latency,
+        "latency_benchmark_cuda": cuda_latency,
         "hardware_profile": hw_profile,
     }
 
@@ -277,15 +365,18 @@ Confusion Matrix (Rows=True, Cols=Predicted):
 
 Per-Class Performance:
 """
-    for c, stats in per_class_metrics.items():
-        report_txt += f"  - {c}: Precision={stats['precision']:.3f}, Recall={stats['recall']:.3f}, F1={stats['f1']:.3f} (N={stats['support']})\n"
+    for c_name, stats in per_class_metrics.items():
+        report_txt += f"  - {c_name:<12}: Precision={stats['precision']:.3f}, Recall={stats['recall']:.3f}, F1={stats['f1']:.3f} (N={stats['support']})\n"
 
     report_txt += f"""
-Latency & Throughput (CPU):
-  - Mean Latency:             {benchmark_stats['latency_mean_ms']:.3f} ms / sample
-  - 95th Percentile:          {benchmark_stats['latency_p95_ms']:.3f} ms
-  - Throughput:               {benchmark_stats['throughput_fps']:.1f} inferences/sec
+Latency & Throughput:
+  - CPU Mean Latency:         {cpu_latency['latency_mean_ms']:.3f} ms / sample ({cpu_latency['throughput_fps']:.1f} FPS)
+  - CPU 95th Percentile:      {cpu_latency['latency_p95_ms']:.3f} ms
+"""
+    if cuda_latency:
+        report_txt += f"  - CUDA Mean Latency:        {cuda_latency['latency_mean_ms']:.3f} ms ({cuda_latency['throughput_fps']:.1f} FPS)\n"
 
+    report_txt += f"""
 Target Deployment (Arduino Uno Q):
   - Parameters:               {hw_profile['parameter_count']:,}
   - Weight Memory (INT8):     {hw_profile['weights_int8_kb']:.2f} KB / {hw_profile['target_flash_kb']:.0f} KB Flash
@@ -305,8 +396,9 @@ Target Deployment (Arduino Uno Q):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate PhotonV0 Perception Stack.")
     parser.add_argument("--config", type=str, default="configs/photon_v0.yaml")
-    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/photon_v0/best_model.pt")
     parser.add_argument("--output-dir", type=str, default="results/photon_v0")
+    parser.add_argument("--allow-synthetic", action="store_true")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -316,7 +408,12 @@ def main() -> None:
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    evaluate_photon_v0(config, checkpoint_path=args.checkpoint, output_dir=args.output_dir)
+    evaluate_photon_v0(
+        config,
+        checkpoint_path=args.checkpoint,
+        output_dir=args.output_dir,
+        allow_synthetic=args.allow_synthetic,
+    )
 
 
 if __name__ == "__main__":

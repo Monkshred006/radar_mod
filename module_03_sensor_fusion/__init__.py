@@ -29,6 +29,8 @@ from module_03_sensor_fusion.radical_adapter import (
     RaDICaLDatasetAdapter,
     RaDICaLDataset,
     RaDICaLFeatureExtractor,
+    get_num_classes,
+    get_class_names,
 )
 
 __all__ = [
@@ -58,4 +60,6 @@ __all__ = [
     "RaDICaLDatasetAdapter",
     "RaDICaLDataset",
     "RaDICaLFeatureExtractor",
+    "get_num_classes",
+    "get_class_names",
 ]

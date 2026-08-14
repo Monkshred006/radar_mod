@@ -4,24 +4,34 @@ Trains PhotonV0 perception stack on RaDICaL radar data with staged hooks
 for Latent Diffusion (V1) and Physics-Informed PINN Constraints (V2).
 
 Usage:
-    python train_photon_v0.py --config configs/photon_v0.yaml --epochs 10
+    python train_photon_v0.py --config configs/photon_v0.yaml --epochs 20
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Dict, Any, Optional, Tuple
-import yaml
 
+# Ensure repository root is in python path
+REPO_ROOT = Path(__file__).resolve().parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import yaml
 
 from module_04_mamba_hybrid.photon_v0 import PhotonV0, count_parameters
 from module_03_sensor_fusion.radical_adapter import RaDICaLDatasetAdapter
@@ -39,10 +49,8 @@ def compute_metrics(
     all_ano_targets: np.ndarray,
 ) -> Dict[str, float]:
     """Compute evaluation metrics: Accuracy, F1, MAE, AUROC."""
-    # 1. Classification Accuracy
     cls_acc = float(np.mean(all_cls_preds == all_cls_targets))
 
-    # 2. Classification Macro F1
     unique_classes = np.unique(np.concatenate([all_cls_targets, all_cls_preds]))
     f1_scores = []
     for c in unique_classes:
@@ -55,14 +63,11 @@ def compute_metrics(
         f1_scores.append(f1)
     macro_f1 = float(np.mean(f1_scores)) if f1_scores else 0.0
 
-    # 3. Anomaly MAE
     ano_mae = float(np.mean(np.abs(all_ano_preds - all_ano_targets)))
 
-    # 4. Detection AUROC (trapezoidal approximation)
     det_targets_bin = (all_det_targets.flatten() > 0.5).astype(int)
     det_scores = all_det_preds.flatten()
 
-    # Sort scores descending
     desc_score_indices = np.argsort(det_scores)[::-1]
     sorted_targets = det_targets_bin[desc_score_indices]
 
@@ -70,7 +75,6 @@ def compute_metrics(
     n_neg = np.sum(sorted_targets == 0)
 
     if n_pos > 0 and n_neg > 0:
-        # Rank-sum AUROC formula
         ranks = np.arange(len(sorted_targets), 0, -1)
         sum_pos_ranks = np.sum(ranks[sorted_targets == 1])
         auroc = float((sum_pos_ranks - (n_pos * (n_pos + 1)) / 2.0) / (n_pos * n_neg))
@@ -122,7 +126,7 @@ def evaluate(
             ano_preds.append(outputs["anomaly"].cpu().numpy())
             ano_targets.append(y_ano.cpu().numpy())
 
-    mean_loss = total_loss / len(dataloader.dataset)
+    mean_loss = total_loss / max(len(dataloader.dataset), 1)
     metrics = compute_metrics(
         all_det_preds=np.concatenate(det_preds, axis=0),
         all_det_targets=np.concatenate(det_targets, axis=0),
@@ -134,13 +138,77 @@ def evaluate(
     return mean_loss, metrics
 
 
-def train_photon_v0(config: Dict[str, Any], override_epochs: Optional[int] = None) -> Dict[str, Any]:
+def plot_training_curves(history: list, output_path: Union[str, Path]) -> None:
+    """Plot and save loss, accuracy, and AUROC training curves."""
+    epochs = [h["epoch"] for h in history]
+    train_loss = [h["train_loss"] for h in history]
+    val_loss = [h["val_loss"] for h in history]
+    acc = [h["accuracy"] for h in history]
+    f1 = [h["f1_score"] for h in history]
+    auroc = [h["auroc"] for h in history]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.patch.set_facecolor("#ffffff")
+
+    # 1. Loss
+    axes[0].plot(epochs, train_loss, label="Train Loss", color="#1f77b4", lw=2)
+    axes[0].plot(epochs, val_loss, label="Val Loss", color="#ff7f0e", lw=2, linestyle="--")
+    axes[0].set_title("Training & Validation Loss", fontsize=12, fontweight="bold")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    # 2. Accuracy & F1
+    axes[1].plot(epochs, acc, label="Val Accuracy", color="#2ca02c", lw=2)
+    axes[1].plot(epochs, f1, label="Val Macro F1", color="#9467bd", lw=2, linestyle="--")
+    axes[1].set_title("Classification Accuracy & Macro F1", fontsize=12, fontweight="bold")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Score")
+    axes[1].set_ylim([0, 1.05])
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    # 3. AUROC
+    axes[2].plot(epochs, auroc, label="Detection AUROC", color="#d62728", lw=2)
+    axes[2].set_title("Target Detection AUROC", fontsize=12, fontweight="bold")
+    axes[2].set_xlabel("Epoch")
+    axes[2].set_ylabel("AUROC")
+    axes[2].set_ylim([0, 1.05])
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend()
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+
+def train_photon_v0(
+    config: Dict[str, Any],
+    override_epochs: Optional[int] = None,
+    allow_synthetic: bool = False,
+    allow_experimental: bool = False,
+) -> Dict[str, Any]:
     """Train PhotonV0 pipeline from configuration dictionary."""
     cfg_data = config.get("dataset", {})
     cfg_model = config.get("model", {})
     cfg_diff = config.get("diffusion", {})
     cfg_phys = config.get("physics", {})
     cfg_train = config.get("training", {})
+    cfg_dec = config.get("decision", {})
+
+    # Freeze V0 Execution Path Check: Ensure experimental features are disabled for V0 baseline
+    if not allow_experimental:
+        if (
+            cfg_diff.get("enabled", False)
+            or cfg_phys.get("enabled", False)
+            or cfg_dec.get("enabled", False)
+            or cfg_model.get("use_attention", False)
+        ):
+            raise ValueError(
+                "V1/V2 features (Diffusion, PINN, RL, Attention) are enabled in config, but baseline V0 requires them disabled. "
+                "Set diffusion.enabled: false, physics.enabled: false, decision.enabled: false, or pass --allow-experimental."
+            )
 
     # Set random seeds
     seed = cfg_train.get("seed", 42)
@@ -156,22 +224,24 @@ def train_photon_v0(config: Dict[str, Any], override_epochs: Optional[int] = Non
 
     print(f"[PhotonShield AI] Training on device: {device}")
 
-    # 1. Dataset Adapter
+    # 1. Dataset Adapter (Synthetic fallback disabled by default)
+    synthetic_fallback = allow_synthetic or cfg_data.get("synthetic_fallback", False)
     adapter = RaDICaLDatasetAdapter(
-        data_path=cfg_data.get("data_path"),
+        data_path=cfg_data.get("data_path", "data/radical"),
         sequence_length=cfg_data.get("sequence_length", 16),
         feature_dim=cfg_data.get("feature_dim", 64),
         num_classes=cfg_data.get("num_classes", 4),
-        normalization=cfg_data.get("normalization", "zscore"),
+        normalization=cfg_data.get("normalization", "db"),
         train_ratio=cfg_data.get("train_ratio", 0.70),
         val_ratio=cfg_data.get("val_ratio", 0.15),
         test_ratio=cfg_data.get("test_ratio", 0.15),
         seed=seed,
+        synthetic_fallback=synthetic_fallback,
     )
 
     batch_size = cfg_train.get("batch_size", 64)
     train_loader, val_loader, test_loader = adapter.get_dataloaders(
-        batch_size=batch_size, num_synthetic_fallback=300
+        batch_size=batch_size, num_synthetic_fallback=500
     )
 
     # 2. Build PhotonV0 Model
@@ -203,7 +273,7 @@ def train_photon_v0(config: Dict[str, Any], override_epochs: Optional[int] = Non
         lambda_physics=cfg_phys.get("lambda_physics", 0.1),
     ).to(device)
 
-    # Parameters & FLOPs estimation
+    # Sizing & MACs
     total_params = count_parameters(model)
     total_macs = estimate_photon_v0_macs(
         input_dim=cfg_model.get("input_dim", 64),
@@ -216,6 +286,7 @@ def train_photon_v0(config: Dict[str, Any], override_epochs: Optional[int] = Non
 
     print("----------------------------------------------------------------")
     print(f" PhotonV0 Parameters: {total_params:,} | Compute: {total_macs:,} MACs (~{total_flops:,} FLOPs)")
+    print(f" Dataset: Real RaDICaL ({len(train_loader.dataset)} Train, {len(val_loader.dataset)} Val, {len(test_loader.dataset)} Test)")
     print(f" Diffusion Branch: {'ENABLED' if diff_aux.enabled else 'DISABLED'} | PINN Constraints: {'ENABLED' if pinn_constraints.enabled else 'DISABLED'}")
     print("----------------------------------------------------------------")
 
@@ -249,6 +320,12 @@ def train_photon_v0(config: Dict[str, Any], override_epochs: Optional[int] = Non
     best_metrics = {}
     history = []
 
+    # CSV Logger
+    csv_file = results_dir / "metrics.csv"
+    with open(csv_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_loss", "val_loss", "accuracy", "f1_score", "mae", "auroc", "lr"])
+
     for epoch in range(1, epochs + 1):
         model.train()
         train_loss = 0.0
@@ -268,12 +345,10 @@ def train_photon_v0(config: Dict[str, Any], override_epochs: Optional[int] = Non
 
             total_step_loss = (l_det_w * loss_det) + (l_cls_w * loss_cls) + (l_ano_w * loss_ano)
 
-            # Optional Diffusion Auxiliary Loss (V1)
             if diff_aux.enabled:
                 loss_diff = diff_aux.compute_loss(outputs["latent"])
                 total_step_loss = total_step_loss + (l_diff_w * loss_diff)
 
-            # Optional PINN Physics Loss (V2)
             if pinn_constraints.enabled:
                 loss_phys = pinn_constraints(outputs["latent"], prediction=outputs)
                 total_step_loss = total_step_loss + loss_phys
@@ -284,18 +359,35 @@ def train_photon_v0(config: Dict[str, Any], override_epochs: Optional[int] = Non
 
             train_loss += total_step_loss.item() * len(x)
 
+        curr_lr = float(scheduler.get_last_lr()[0])
         scheduler.step()
-        train_loss /= len(train_loader.dataset)
+        train_loss /= max(len(train_loader.dataset), 1)
 
         # Validation
         val_loss, val_metrics = evaluate(model, val_loader, device)
 
-        history.append({
+        row_data = {
             "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            **val_metrics,
-        })
+            "train_loss": round(train_loss, 4),
+            "val_loss": round(val_loss, 4),
+            "lr": curr_lr,
+            **{k: round(v, 4) for k, v in val_metrics.items()},
+        }
+        history.append(row_data)
+
+        # Append to CSV
+        with open(csv_file, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch,
+                row_data["train_loss"],
+                row_data["val_loss"],
+                row_data["accuracy"],
+                row_data["f1_score"],
+                row_data["mae"],
+                row_data["auroc"],
+                row_data["lr"],
+            ])
 
         print(
             f"Epoch [{epoch:02d}/{epochs:02d}] "
@@ -304,13 +396,21 @@ def train_photon_v0(config: Dict[str, Any], override_epochs: Optional[int] = Non
             f"MAE: {val_metrics['mae']:.4f} | AUROC: {val_metrics['auroc']:.4f}"
         )
 
+        # Save Best Model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_metrics = dict(val_metrics)
+            torch.save(model.state_dict(), checkpoint_dir / "best_model.pt")
             torch.save(model.state_dict(), checkpoint_dir / "photon_v0_best.pt")
 
+        # Save Last Model
+        torch.save(model.state_dict(), checkpoint_dir / "last_model.pt")
+
+    # Generate training curves plot
+    plot_training_curves(history, results_dir / "training_curves.png")
+
     # Evaluate on Test Set using best model
-    model.load_state_dict(torch.load(checkpoint_dir / "photon_v0_best.pt", map_location=device))
+    model.load_state_dict(torch.load(checkpoint_dir / "best_model.pt", map_location=device))
     test_loss, test_metrics = evaluate(model, test_loader, device)
 
     print("================================================================")
@@ -340,6 +440,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=None, help="Override epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
+    parser.add_argument("--allow-synthetic", action="store_true", help="Allow synthetic fallback if real data missing")
+    parser.add_argument("--allow-experimental", action="store_true", help="Allow V1/V2 features")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -354,7 +456,12 @@ def main() -> None:
     if args.lr is not None:
         config["training"]["learning_rate"] = args.lr
 
-    train_photon_v0(config, override_epochs=args.epochs)
+    train_photon_v0(
+        config,
+        override_epochs=args.epochs,
+        allow_synthetic=args.allow_synthetic,
+        allow_experimental=args.allow_experimental,
+    )
 
 
 if __name__ == "__main__":
