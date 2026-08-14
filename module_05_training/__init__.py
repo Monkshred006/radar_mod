@@ -25,6 +25,8 @@ from module_05_training.trainer import Trainer
 from module_05_training.evaluator import Evaluator
 from module_05_training.profiling import profile_model
 from module_05_training.experiment import ExperimentRunner, ABLATION_VARIANTS
+from module_05_training.noise_scheduler import NoiseScheduler
+from module_05_training.diffusion_auxiliary import DiffusionAuxiliary
 
 __all__ = [
     "TrainingConfig",
@@ -55,4 +57,6 @@ __all__ = [
     "profile_model",
     "ExperimentRunner",
     "ABLATION_VARIANTS",
+    "NoiseScheduler",
+    "DiffusionAuxiliary",
 ]
