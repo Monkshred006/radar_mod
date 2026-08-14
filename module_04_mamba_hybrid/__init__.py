@@ -22,6 +22,10 @@ from module_04_mamba_hybrid.losses import get_loss_fn, MultiTaskLoss
 from module_04_mamba_hybrid.checkpointing import save_checkpoint, load_checkpoint
 from module_04_mamba_hybrid.profiling import profile_model, count_parameters
 
+from module_04_mamba_hybrid.mamba_core import PurePyTorchSSM, MiniMambaBlock
+from module_04_mamba_hybrid.mamba_attention import OptionalAttentionLayer, MambaAttentionHybridBlock
+from module_04_mamba_hybrid.photon_v0 import PhotonV0, DetectionHead, AnomalyHead
+
 __all__ = [
     "MambaHybridConfig",
     "TaskHeadConfig",
@@ -42,4 +46,11 @@ __all__ = [
     "load_checkpoint",
     "profile_model",
     "count_parameters",
+    "PurePyTorchSSM",
+    "MiniMambaBlock",
+    "OptionalAttentionLayer",
+    "MambaAttentionHybridBlock",
+    "PhotonV0",
+    "DetectionHead",
+    "AnomalyHead",
 ]
