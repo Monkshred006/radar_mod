@@ -1,0 +1,72 @@
+# ==============================================================================
+# PhotonShield AI - Phase V1.0 Latent Diffusion Configuration
+# Conditional Latent Temporal Reconstruction Baseline
+# ==============================================================================
+
+dataset:
+  name: radical
+  data_path: C:/Users/worka/research/photonpinn/data/radical
+  splits_dir: C:/Users/worka/research/photonpinn/data/radical/splits
+  synthetic_fallback: false
+  sequence_length: 16
+  feature_dim: 64
+  max_train_samples: null
+  max_val_samples: null
+  max_test_samples: null
+  num_classes: 4
+  normalization: db
+  seed: 42
+
+v0:
+  checkpoint: checkpoints/v0_frozen/best_model.pt
+  frozen: true
+
+diffusion:
+  enabled: true
+  latent_dim: 64
+  hidden_dim: 128
+  num_blocks: 2
+  timesteps: 50
+  prediction_type: epsilon
+
+corruption:
+  enabled: true
+
+  gaussian_noise:
+    enabled: false
+    sigma: 0.05
+
+  frame_dropout:
+    enabled: true
+    probability: 0.20
+
+  temporal_gap:
+    enabled: false
+    gap_length: 4
+
+  amplitude_scaling:
+    enabled: false
+
+training:
+  batch_size: 16
+  epochs: 50
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  amp: true
+  seed: 42
+  early_stopping_patience: 10
+  device: auto
+  checkpoint_dir: checkpoints/v1_diffusion
+  results_dir: results/photon_v1
+
+attention:
+  enabled: false
+
+pinn:
+  enabled: false
+
+rl:
+  enabled: false
+
+bitnet:
+  enabled: false
