@@ -1,0 +1,97 @@
+# ==============================================================================
+# PhotonShield AI - Phase V2 Physics-Informed Latent Diffusion Configuration
+# ==============================================================================
+
+dataset:
+  name: radical
+  data_path: C:/Users/worka/research/photonpinn/data/radical
+  splits_dir: C:/Users/worka/research/photonpinn/data/radical/splits
+  synthetic_fallback: false
+  sequence_length: 16
+  feature_dim: 64
+  max_train_samples: null
+  max_val_samples: null
+  max_test_samples: null
+  num_classes: 4
+  normalization: db
+  seed: 42
+
+v0:
+  checkpoint: checkpoints/v0_frozen/best_model.pt
+  frozen: true
+
+diffusion:
+  enabled: true
+  latent_dim: 64
+  hidden_dim: 128
+  num_blocks: 2
+  timesteps: 50
+  beta_schedule: linear
+  inference_steps: 50
+  prediction_type: epsilon
+
+corruption:
+  enabled: true
+
+  gaussian_noise:
+    enabled: false
+    sigma: 0.05
+
+  frame_dropout:
+    enabled: true
+    probability: 0.20
+
+  temporal_gap:
+    enabled: false
+    gap_length: 4
+
+  amplitude_scaling:
+    enabled: false
+
+losses:
+  lambda_diff: 1.0
+  lambda_recon: 0.5
+  lambda_missing: 1.0
+
+physics:
+  enabled: true
+  global_weight: 0.05
+  softargmax:
+    temperature: 0.1
+  kinematic:
+    enabled: true
+    lambda: 1.0
+    velocity_sign: 1
+    dt: 0.03333333333333333
+  acceleration:
+    enabled: true
+    lambda: 0.1
+    a_ref: 5.0
+    tau: 1.0
+  energy:
+    enabled: true
+    lambda: 0.1
+
+training:
+  batch_size: 16
+  epochs: 50
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  amp: true
+  seed: 42
+  early_stopping_patience: 10
+  device: auto
+  checkpoint_dir: checkpoints/v2_physics
+  results_dir: results/photon_v2
+
+attention:
+  enabled: false
+
+pinn:
+  enabled: true
+
+rl:
+  enabled: false
+
+bitnet:
+  enabled: false
