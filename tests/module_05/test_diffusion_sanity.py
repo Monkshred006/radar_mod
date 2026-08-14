@@ -13,7 +13,7 @@ from module_05_latent_diffusion.latent_diffusion import LatentDiffusionModel
 
 
 class TestDiffusionSanity:
-    """Comprehensive sanity tests A through H for latent diffusion."""
+    """Comprehensive sanity tests A through I for latent diffusion."""
 
     @pytest.fixture
     def scheduler(self):
@@ -23,148 +23,120 @@ class TestDiffusionSanity:
     def denoiser(self):
         return LightweightDenoiser(latent_dim=64, hidden_dim=128, num_blocks=2)
 
-    def test_h_known_noise_exact_inversion(self, scheduler):
-        """TEST H — KNOWN NOISE TEST: Verify recovered z0 equals original z0 when using exact noise."""
+    def test_a_scheduler_forward_diffusion(self, scheduler):
+        """TEST A — SCHEDULER FORWARD DIFFUSION: Verify q(z_t | z_0) math."""
         B, T, D = 4, 16, 64
         z0 = torch.randn(B, T, D)
         noise = torch.randn(B, T, D)
-
-        for t_val in [0, 5, 25, 49]:
-            t = torch.full((B,), t_val, dtype=torch.long)
-            zt = scheduler.add_noise(original_samples=z0, noise=noise, timesteps=t)
-            recovered_z0 = scheduler.predict_z0_from_eps(z_t=zt, eps_pred=noise, timesteps=t)
-
-            mse = torch.mean((recovered_z0 - z0) ** 2).item()
-            assert mse < 1e-5, f"Known noise test failed at t={t_val}: MSE={mse}"
-
-    def test_g_zero_diffusion_step(self, scheduler):
-        """TEST G — ZERO DIFFUSION STEP / t=0: Verify scheduler behavior at t=0."""
-        B, T, D = 2, 16, 64
-        z0 = torch.randn(B, T, D)
-        noise = torch.zeros(B, T, D)
-        t = torch.zeros((B,), dtype=torch.long)
+        t = torch.tensor([0, 10, 25, 49], dtype=torch.long)
 
         zt = scheduler.add_noise(original_samples=z0, noise=noise, timesteps=t)
-        # At t=0 with 0 noise, z_t should be almost exactly sqrt(alpha_0) * z0 ≈ z0
-        assert torch.allclose(zt, z0 * scheduler.sqrt_alphas_cumprod[0], atol=1e-5)
+        
+        # Verify manual formulation
+        sqrt_alpha = scheduler.sqrt_alphas_cumprod[t].view(-1, 1, 1)
+        sqrt_one_minus = scheduler.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1)
+        expected = sqrt_alpha * z0 + sqrt_one_minus * noise
+        assert torch.allclose(zt, expected, atol=1e-6)
 
-    def test_a_no_corruption_preservation(self, scheduler, denoiser):
-        """TEST A — NO CORRUPTION: mask=1 everywhere should preserve input without distortion."""
-        B, T, D = 2, 16, 64
+    def test_b_x0_reconstruction(self, scheduler):
+        """TEST B — X0 RECONSTRUCTION: Verify clean latent inversion from predicted noise."""
+        B, T, D = 4, 16, 64
         z0 = torch.randn(B, T, D)
-        mask = torch.ones(B, T, 1)
+        noise = torch.randn(B, T, D)
+        t = torch.tensor([0, 5, 20, 45], dtype=torch.long)
 
-        z_hat = scheduler.reconstruct(
-            denoiser=denoiser,
-            condition=z0,
-            mask=mask,
-            num_inference_steps=10,
-        )
+        zt = scheduler.add_noise(z0, noise, t)
+        z0_hat = scheduler.predict_z0_from_eps(z_t=zt, eps_pred=noise, timesteps=t)
+        assert torch.allclose(z0_hat, z0, atol=1e-5)
 
-        # Observed frames must match condition z0 exactly
-        obs_mse = torch.mean((z_hat * mask - z0 * mask) ** 2).item()
-        assert obs_mse < 1e-6, f"No corruption test failed: obs_mse={obs_mse}"
-
-    def test_b_extreme_corruption(self, scheduler, denoiser):
-        """TEST B — 100% / EXTREME CORRUPTION: Model degrades gracefully without NaN/Inf."""
-        B, T, D = 2, 16, 64
-        z0 = torch.randn(B, T, D)
-        mask = torch.zeros(B, T, 1)  # 100% missing
-        zc = z0 * mask
-
-        z_hat = scheduler.reconstruct(
-            denoiser=denoiser,
-            condition=zc,
-            mask=mask,
-            num_inference_steps=10,
-        )
-
-        assert not torch.isnan(z_hat).any(), "NaN found in extreme corruption output"
-        assert not torch.isinf(z_hat).any(), "Inf found in extreme corruption output"
-        assert z_hat.shape == (B, T, D)
-
-    def test_c_single_missing_frame(self, scheduler, denoiser):
-        """TEST C — SINGLE MISSING FRAME: Exactly one missing frame (index 8)."""
+    def test_c_conditional_reconstruction(self, scheduler, denoiser):
+        """TEST C — CONDITIONAL RECONSTRUCTION: Reconstruct with conditional mask."""
         B, T, D = 2, 16, 64
         z0 = torch.randn(B, T, D)
         mask = torch.ones(B, T, 1)
         mask[:, 8, :] = 0.0
         zc = z0 * mask
 
-        z_hat = scheduler.reconstruct(
-            denoiser=denoiser,
-            condition=zc,
-            mask=mask,
-            num_inference_steps=10,
-        )
+        z_hat = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=True)
+        assert z_hat.shape == (B, T, D)
+        assert not torch.isnan(z_hat).any()
+        assert not torch.isinf(z_hat).any()
 
-        # Observed frames preserved
-        obs_diff = (z_hat - z0) * mask
-        assert torch.mean(obs_diff ** 2).item() < 1e-6
-
-        # Missing frame is populated and finite
-        missing_frame = z_hat[:, 8, :]
-        assert not torch.isnan(missing_frame).any()
-        assert not torch.all(missing_frame == 0.0)
-
-    def test_d_contiguous_temporal_gap(self, scheduler, denoiser):
-        """TEST D — CONTIGUOUS TEMPORAL GAP: Frames 6 to 9 missing."""
+    def test_d_no_corruption(self, scheduler, denoiser):
+        """TEST D — NO CORRUPTION: mask=1 everywhere preserves input with 0.0 error."""
         B, T, D = 2, 16, 64
         z0 = torch.randn(B, T, D)
         mask = torch.ones(B, T, 1)
-        mask[:, 6:10, :] = 0.0
-        zc = z0 * mask
 
-        z_hat = scheduler.reconstruct(
-            denoiser=denoiser,
-            condition=zc,
-            mask=mask,
-            num_inference_steps=10,
-        )
-
-        # Outside gap is preserved
-        obs_mse = torch.mean(((z_hat - z0) * mask) ** 2).item()
-        assert obs_mse < 1e-6
-
-        # Inside gap is synthesized
-        gap_frames = z_hat[:, 6:10, :]
-        assert not torch.isnan(gap_frames).any()
+        z_hat = scheduler.reconstruct(denoiser, z0, mask, num_inference_steps=10, deterministic=True)
+        obs_mse = torch.mean((z_hat - z0) ** 2).item()
+        assert obs_mse < 1e-6, f"No corruption test failed: obs_mse={obs_mse}"
 
     def test_e_observed_frame_preservation(self, scheduler, denoiser):
-        """TEST E — OBSERVED FRAME PRESERVATION: Observed frames have zero drift from z_c."""
+        """TEST E — OBSERVED FRAME PRESERVATION: Observed frames have zero drift."""
         B, T, D = 4, 16, 64
         z0 = torch.randn(B, T, D)
         corruption = RadarLatentCorruption({"enabled": True, "frame_dropout": {"enabled": True, "probability": 0.3}})
         zc, mask = corruption(z0)
 
-        z_hat = scheduler.reconstruct(
-            denoiser=denoiser,
-            condition=zc,
-            mask=mask,
-            num_inference_steps=15,
-        )
-
+        z_hat = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=15, deterministic=True)
         metrics = DiffusionLoss.reconstruction_metrics(z_hat, z0, mask)
         assert metrics["observed_mse"] < 1e-6, f"Observed MSE drifted: {metrics['observed_mse']}"
 
-    def test_deterministic_sampling_reproducibility(self, scheduler, denoiser):
-        """Verify deterministic=True produces 100% identical outputs and stochastic mode can vary."""
+    def test_f_missing_frame_reconstruction(self, scheduler, denoiser):
+        """TEST F — MISSING FRAME RECONSTRUCTION: Missing frames are synthesized and finite."""
+        B, T, D = 2, 16, 64
+        z0 = torch.randn(B, T, D)
+        mask = torch.ones(B, T, 1)
+        mask[:, 6:10, :] = 0.0  # frames 6-9 missing
+        zc = z0 * mask
+
+        z_hat = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=True)
+        missing_frames = z_hat[:, 6:10, :]
+        assert not torch.isnan(missing_frames).any()
+        assert not torch.all(missing_frames == 0.0)
+
+    def test_g_known_noise_mathematical_inversion(self, scheduler):
+        """TEST G — KNOWN NOISE MATHEMATICAL INVERSION: Invert at arbitrary timesteps."""
+        B, T, D = 4, 16, 64
+        z0 = torch.randn(B, T, D)
+        noise = torch.randn(B, T, D)
+
+        for t_val in [0, 5, 25, 49]:
+            t = torch.full((B,), t_val, dtype=torch.long)
+            zt = scheduler.add_noise(z0, noise, t)
+            recovered = scheduler.predict_z0_from_eps(zt, noise, t)
+            mse = torch.mean((recovered - z0) ** 2).item()
+            assert mse < 1e-5, f"Inversion failed at t={t_val}: MSE={mse}"
+
+    def test_h_latent_consistency(self, scheduler, denoiser):
+        """TEST H — LATENT CONSISTENCY & EXTREME CORRUPTION: 100% missing stability."""
+        B, T, D = 2, 16, 64
+        z0 = torch.randn(B, T, D)
+        mask = torch.zeros(B, T, 1)
+        zc = z0 * mask
+
+        z_hat = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=True)
+        assert not torch.isnan(z_hat).any()
+        assert not torch.isinf(z_hat).any()
+        assert z_hat.shape == (B, T, D)
+
+    def test_i_deterministic_sampling_reproducibility(self, scheduler, denoiser):
+        """TEST I — DETERMINISTIC SAMPLING REPRODUCIBILITY: Exactly identical outputs."""
         B, T, D = 2, 16, 64
         z0 = torch.randn(B, T, D)
         mask = torch.ones(B, T, 1)
         mask[:, 4:8, :] = 0.0
         zc = z0 * mask
 
-        # Run deterministic reconstruction twice
         out1_det = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=True)
         out2_det = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=True)
 
-        assert torch.allclose(out1_det, out2_det, atol=1e-7), "Deterministic reconstruction produced non-identical outputs!"
+        max_diff = torch.max(torch.abs(out1_det - out2_det)).item()
+        assert max_diff < 1e-7, f"Deterministic mode produced difference: {max_diff}"
 
-        # Run stochastic reconstruction twice
+        # Stochastic mode variation
         out1_stoch = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=False)
         out2_stoch = scheduler.reconstruct(denoiser, zc, mask, num_inference_steps=10, deterministic=False)
-
-        # Missing frames in stochastic mode should have different random initializations/perturbations
         diff_stoch = torch.max(torch.abs(out1_stoch - out2_stoch)).item()
-        assert diff_stoch > 0.0, "Stochastic reconstruction did not vary!"
+        assert diff_stoch > 0.0, "Stochastic mode did not vary"
