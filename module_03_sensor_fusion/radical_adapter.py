@@ -113,6 +113,63 @@ class RaDICaLFeatureExtractor:
         return feat.astype(np.float32)
 
 
+class RadarAugmentation:
+    """Radar-aware data augmentations for Range-Doppler sequences [T, D]."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        amplitude_scale: float = 0.1,
+        gaussian_noise_std: float = 0.02,
+        temporal_mask_ratio: float = 0.1,
+        frame_dropout_prob: float = 0.1,
+        temporal_jitter: int = 1,
+    ) -> None:
+        self.enabled = enabled
+        self.amplitude_scale = amplitude_scale
+        self.gaussian_noise_std = gaussian_noise_std
+        self.temporal_mask_ratio = temporal_mask_ratio
+        self.frame_dropout_prob = frame_dropout_prob
+        self.temporal_jitter = temporal_jitter
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply radar augmentations to tensor [T, D]."""
+        if not self.enabled:
+            return x
+
+        x = x.clone()
+        T, D = x.shape
+
+        # 1. Amplitude scaling
+        if self.amplitude_scale > 0:
+            scale = 1.0 + (torch.rand(1).item() * 2 - 1) * self.amplitude_scale
+            x = x * scale
+
+        # 2. Additive Gaussian noise
+        if self.gaussian_noise_std > 0:
+            noise = torch.randn_like(x) * self.gaussian_noise_std
+            x = x + noise
+
+        # 3. Temporal masking (zero out contiguous frames)
+        if self.temporal_mask_ratio > 0 and torch.rand(1).item() < 0.5:
+            mask_len = max(1, int(T * self.temporal_mask_ratio))
+            start_idx = torch.randint(0, max(1, T - mask_len + 1), (1,)).item()
+            x[start_idx : start_idx + mask_len, :] = 0.0
+
+        # 4. Frame dropout
+        if self.frame_dropout_prob > 0:
+            for t in range(1, T):
+                if torch.rand(1).item() < self.frame_dropout_prob:
+                    x[t] = x[t - 1]  # repeat previous frame
+
+        # 5. Temporal jitter (small roll along time dimension)
+        if self.temporal_jitter > 0 and torch.rand(1).item() < 0.3:
+            shift = torch.randint(-self.temporal_jitter, self.temporal_jitter + 1, (1,)).item()
+            x = torch.roll(x, shifts=shift, dims=0)
+
+        return x
+
+
 class RaDICaLDataset(Dataset):
     """PyTorch Dataset for RaDICaL radar sequences [T, D]."""
 
@@ -122,6 +179,7 @@ class RaDICaLDataset(Dataset):
         labels_det: np.ndarray,
         labels_cls: np.ndarray,
         labels_ano: np.ndarray,
+        transform: Optional[RadarAugmentation] = None,
     ) -> None:
         """Initialize dataset.
 
@@ -130,18 +188,24 @@ class RaDICaLDataset(Dataset):
             labels_det: Detection labels [N, 1] (0 or 1).
             labels_cls: Classification labels [N] (integer class 0..C-1).
             labels_ano: Anomaly scores [N, 1] (continuous float).
+            transform: Optional RadarAugmentation callable.
         """
         self.features = torch.as_tensor(features, dtype=torch.float32)
         self.labels_det = torch.as_tensor(labels_det, dtype=torch.float32)
         self.labels_cls = torch.as_tensor(labels_cls, dtype=torch.long)
         self.labels_ano = torch.as_tensor(labels_ano, dtype=torch.float32)
+        self.transform = transform
 
     def __len__(self) -> int:
         return len(self.features)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        feat = self.features[idx]
+        if self.transform is not None:
+            feat = self.transform(feat)
+
         return {
-            "features": self.features[idx],        # [T, D]
+            "features": feat,                      # [T, D]
             "detection": self.labels_det[idx],      # [1]
             "classification": self.labels_cls[idx], # scalar int
             "anomaly": self.labels_ano[idx],        # [1]
@@ -154,6 +218,7 @@ class RaDICaLDatasetAdapter:
     def __init__(
         self,
         data_path: Optional[Union[str, Path]] = "data/radical",
+        splits_dir: Optional[Union[str, Path]] = None,
         sequence_length: int = 16,
         feature_dim: int = 64,
         num_classes: int = 4,
@@ -163,8 +228,10 @@ class RaDICaLDatasetAdapter:
         test_ratio: float = 0.15,
         seed: int = 42,
         synthetic_fallback: bool = False,
+        augmentation: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.data_path = Path(data_path) if data_path else None
+        self.splits_dir = Path(splits_dir) if splits_dir else (self.data_path / "splits" if self.data_path else None)
         self.sequence_length = sequence_length
         self.feature_dim = feature_dim
         self.num_classes = num_classes
@@ -174,6 +241,7 @@ class RaDICaLDatasetAdapter:
         self.test_ratio = test_ratio
         self.seed = seed
         self.synthetic_fallback = synthetic_fallback
+        self.augmentation = augmentation
 
         self.extractor = RaDICaLFeatureExtractor(
             feature_dim=feature_dim, normalization=normalization
@@ -187,6 +255,49 @@ class RaDICaLDatasetAdapter:
             for t in range(T):
                 all_feats[i, t] = self.extractor.extract(rd_tensors[i, t])
         return all_feats
+
+    def _load_split_from_file_list(
+        self, split_dir: Path, split_file: Path
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Load exact sequence files specified in split txt file."""
+        if not split_dir.exists() or not split_file.exists():
+            return None
+        with open(split_file, "r", encoding="utf-8") as f:
+            file_names = [line.strip() for line in f if line.strip()]
+        if not file_names:
+            return None
+
+        feats_list, det_list, cls_list, ano_list = [], [], [], []
+        for fname in file_names:
+            fpath = split_dir / fname
+            if not fpath.exists():
+                continue
+            data = np.load(fpath)
+            if "features" in data:
+                feats_list.append(data["features"])
+            elif "rd_tensor" in data:
+                rd_seq = data["rd_tensor"]  # [T, R, D_bins]
+                seq_feats = [self.extractor.extract(rd_seq[t]) for t in range(len(rd_seq))]
+                feats_list.append(np.stack(seq_feats, axis=0))
+
+            det_val = data.get("detection", np.array([1.0 if data.get("classification", 0) > 0 else 0.0], dtype=np.float32))
+            det_list.append(det_val if det_val.ndim == 1 else det_val.flatten())
+            cls_list.append(int(data.get("classification", 0)))
+            ano_val = data.get("anomaly", np.array([0.0], dtype=np.float32))
+            ano_list.append(ano_val if ano_val.ndim == 1 else ano_val.flatten())
+
+        if not feats_list:
+            return None
+
+        feats = np.stack(feats_list, axis=0).astype(np.float32)
+        det = np.array(det_list, dtype=np.float32)
+        if det.ndim == 1:
+            det = det[:, None]
+        cls_lbl = np.array(cls_list, dtype=np.int64)
+        ano = np.array(ano_list, dtype=np.float32)
+        if ano.ndim == 1:
+            ano = ano[:, None]
+        return feats, det, cls_lbl, ano
 
     def _load_split_directory(self, split_dir: Path) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         """Load data from a partition directory containing .h5 or .npz files."""
@@ -352,7 +463,25 @@ class RaDICaLDatasetAdapter:
         num_synthetic_fallback: int = 300,
     ) -> Tuple[RaDICaLDataset, RaDICaLDataset, RaDICaLDataset]:
         """Split data and return (train_dataset, val_dataset, test_dataset)."""
-        # Check if train/val/test directories already exist
+        train_aug = RadarAugmentation(**self.augmentation) if self.augmentation else None
+
+        # 1. Check if fixed split files exist in splits_dir
+        if self.splits_dir and self.splits_dir.exists() and self.data_path:
+            train_split_f = self.splits_dir / "train.txt"
+            val_split_f = self.splits_dir / "val.txt"
+            test_split_f = self.splits_dir / "test.txt"
+
+            train_data = self._load_split_from_file_list(self.data_path / "train", train_split_f)
+            val_data = self._load_split_from_file_list(self.data_path / "val", val_split_f)
+            test_data = self._load_split_from_file_list(self.data_path / "test", test_split_f)
+
+            if train_data is not None and val_data is not None and test_data is not None:
+                train_ds = RaDICaLDataset(*train_data, transform=train_aug)
+                val_ds = RaDICaLDataset(*val_data, transform=None)
+                test_ds = RaDICaLDataset(*test_data, transform=None)
+                return train_ds, val_ds, test_ds
+
+        # 2. Check if train/val/test directories exist
         if self.data_path and self.data_path.exists():
             train_dir = self.data_path / "train"
             val_dir = self.data_path / "val"
@@ -363,9 +492,9 @@ class RaDICaLDatasetAdapter:
             test_data = self._load_split_directory(test_dir)
 
             if train_data is not None and val_data is not None and test_data is not None:
-                train_ds = RaDICaLDataset(*train_data)
-                val_ds = RaDICaLDataset(*val_data)
-                test_ds = RaDICaLDataset(*test_data)
+                train_ds = RaDICaLDataset(*train_data, transform=train_aug)
+                val_ds = RaDICaLDataset(*val_data, transform=None)
+                test_ds = RaDICaLDataset(*test_data, transform=None)
                 return train_ds, val_ds, test_ds
 
         feats, det, cls_lbl, ano = self.load_data(num_synthetic_fallback=num_synthetic_fallback)
@@ -381,9 +510,9 @@ class RaDICaLDatasetAdapter:
         val_idx = indices[n_train : n_train + n_val]
         test_idx = indices[n_train + n_val :]
 
-        train_ds = RaDICaLDataset(feats[train_idx], det[train_idx], cls_lbl[train_idx], ano[train_idx])
-        val_ds = RaDICaLDataset(feats[val_idx], det[val_idx], cls_lbl[val_idx], ano[val_idx])
-        test_ds = RaDICaLDataset(feats[test_idx], det[test_idx], cls_lbl[test_idx], ano[test_idx])
+        train_ds = RaDICaLDataset(feats[train_idx], det[train_idx], cls_lbl[train_idx], ano[train_idx], transform=train_aug)
+        val_ds = RaDICaLDataset(feats[val_idx], det[val_idx], cls_lbl[val_idx], ano[val_idx], transform=None)
+        test_ds = RaDICaLDataset(feats[test_idx], det[test_idx], cls_lbl[test_idx], ano[test_idx], transform=None)
 
         return train_ds, val_ds, test_ds
 
