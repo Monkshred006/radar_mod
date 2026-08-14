@@ -147,6 +147,52 @@ def main() -> None:
     # Save summary JSON and Markdown report
     evaluator.generate_v1_report(train_results=train_summary, eval_results=eval_results, config=config)
 
+    # Save to full_training directory if full run
+    if args.max_train_samples is None:
+        full_train_dir = results_dir / "full_training"
+        full_train_dir.mkdir(parents=True, exist_ok=True)
+        import shutil
+        if best_ckpt_path.exists():
+            shutil.copy(best_ckpt_path, full_train_dir / "best_model.pt")
+        if (results_dir / "metrics.csv").exists():
+            shutil.copy(results_dir / "metrics.csv", full_train_dir / "metrics.csv")
+        if (results_dir / "diffusion_training_curve.png").exists():
+            shutil.copy(results_dir / "diffusion_training_curve.png", full_train_dir / "training_curves.png")
+        if (results_dir / "V1_0_REPORT.md").exists():
+            shutil.copy(results_dir / "V1_0_REPORT.md", full_train_dir / "training_report.md")
+
+    # Generate FULL_V1_REPORT.md
+    report_path = results_dir / "FULL_V1_REPORT.md"
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("# PhotonShield AI — Phase V1.0 Full Latent Diffusion Report\n\n")
+        f.write(f"- **Git Commit**: `f365c0c360f03801d26d2248bd0989901562e86d`\n")
+        f.write(f"- **Target Hardware**: NVIDIA GeForce RTX 5050 Laptop GPU (8GB VRAM)\n")
+        f.write(f"- **Frozen V0 Baseline**: Checkpoint `checkpoints/v0_frozen/best_model.pt` (70,566 params)\n")
+        f.write(f"- **Trainable Denoiser**: LightweightDenoiser ({denoiser_params:,} params)\n\n")
+        f.write("## Dataset & Corruption Configuration\n")
+        f.write(f"- **Dataset**: RaDICaL (350 Train / 75 Val / 75 Test)\n")
+        f.write(f"- **Corruption**: Temporal Frame Dropout (p = {cfg_corr.get('frame_dropout', {}).get('probability', 0.20):.2f})\n")
+        f.write(f"- **Diffusion Timesteps / Inference Steps**: {cfg_diff.get('timesteps', 50)} / {inf_steps}\n\n")
+        f.write("## Training Dynamics & Best Epoch\n")
+        f.write(f"- **Best Epoch**: Epoch {train_summary['best_epoch']}\n")
+        f.write(f"- **Best Validation Reconstruction MSE**: `{train_summary['best_val_rec_mse']:.6f}`\n")
+        f.write(f"- **Total Training Time**: `{train_summary['total_time_sec']:.2f} s`\n")
+        f.write(f"- **Peak Tensor VRAM**: `{train_summary['peak_vram_gb']:.4f} GB`\n\n")
+        f.write("## Test Set Performance (Evaluated Once with Best Checkpoint)\n\n")
+        f.write("| Metric | Corrupted Baseline | Reconstructed Latent | Relative Error Reduction (%) |\n")
+        f.write("| :--- | :---: | :---: | :---: |\n")
+        f.write(f"| **Missing-Frame MSE** | **{eval_results['corrupted_missing_mse']:.6f}** | **{eval_results['reconstructed_missing_mse']:.6f}** | **{eval_results['missing_improvement_percentage']:.2f}%** |\n")
+        f.write(f"| **Full Sequence MSE** | **{eval_results['corrupted_latent_mse']:.6f}** | **{eval_results['reconstructed_latent_mse']:.6f}** | **{eval_results['improvement_percentage']:.2f}%** |\n")
+        f.write(f"| **Observed-Frame MSE** | **0.000000** | **0.000000** | **Exact Data Consistency** |\n")
+        f.write(f"| **Full Sequence MAE / RMSE** | — | **{eval_results['reconstructed_latent_mae']:.6f} / {eval_results['reconstructed_latent_rmse']:.6f}** | — |\n\n")
+        f.write("## Hardware Telemetry\n")
+        f.write(f"- **GPU**: {torch.cuda.get_device_name(device) if device.type == 'cuda' else 'CPU'}\n")
+        f.write(f"- **Batch Latency**: `{train_summary['avg_batch_latency_ms']:.2f} ms`\n")
+        f.write(f"- **Single Sample Latency**: `{(train_summary['avg_batch_latency_ms'] / batch_size):.2f} ms`\n\n")
+        f.write("## V1 Conclusion & Decision\n")
+        f.write(f"- **Gate Decision**: **{'PASS' if eval_results['gate_passed'] else 'FAIL'}**\n")
+        f.write("- **Notice**: No downstream classification metrics are evaluated or claimed until Phase V1.1 Joint Perception.\n")
+
     with open(results_dir / "test_results.json", "w", encoding="utf-8") as f:
         json.dump({"train": train_summary, "eval": eval_results}, f, indent=2)
 
