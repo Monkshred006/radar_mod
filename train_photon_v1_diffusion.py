@@ -41,6 +41,7 @@ def set_seed(seed: int = 42) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train PhotonShield AI Phase V1.0 Latent Diffusion Model.")
     parser.add_argument("--config", type=str, default="configs/photon_v1_diffusion.yaml", help="Path to config yaml")
+    parser.add_argument("--max_train_samples", type=int, default=None, help="Optional sample limit for overfit sanity test")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -55,11 +56,11 @@ def main() -> None:
     cfg_v0 = config.get("v0", {})
     cfg_diff = config.get("diffusion", {})
     cfg_corr = config.get("corruption", {})
+    cfg_loss = config.get("losses", {})
 
     seed = int(cfg_train.get("seed", 42))
     set_seed(seed)
 
-    # Device
     dev_str = cfg_train.get("device", "auto")
     device = torch.device("cuda" if torch.cuda.is_available() and dev_str == "auto" else dev_str)
     print(f"[PhotonShield AI V1.0] Device selected: {device}")
@@ -78,6 +79,18 @@ def main() -> None:
 
     batch_size = int(cfg_train.get("batch_size", 16))
     train_loader, val_loader, test_loader = adapter.get_dataloaders(batch_size=batch_size)
+
+    # Optional overfit sample limit
+    if args.max_train_samples is not None:
+        subset_indices = list(range(min(args.max_train_samples, len(train_loader.dataset))))
+        from torch.utils.data import Subset
+        train_loader = torch.utils.data.DataLoader(
+            Subset(train_loader.dataset, subset_indices),
+            batch_size=min(batch_size, len(subset_indices)),
+            shuffle=True,
+        )
+        print(f"[PhotonShield AI V1.0] Overfit Mode Active: Training on {len(subset_indices)} samples")
+
     print(f"[PhotonShield AI V1.0] RaDICaL Splits: {len(train_loader.dataset)} Train, {len(val_loader.dataset)} Val, {len(test_loader.dataset)} Test")
 
     # 2. Build Latent Diffusion Model with Frozen V0 Encoder
@@ -88,7 +101,9 @@ def main() -> None:
         hidden_dim=int(cfg_diff.get("hidden_dim", 128)),
         num_blocks=int(cfg_diff.get("num_blocks", 2)),
         timesteps=int(cfg_diff.get("timesteps", 50)),
+        beta_schedule=cfg_diff.get("beta_schedule", "linear"),
         corruption_config=cfg_corr,
+        loss_config=cfg_loss,
     ).to(device)
 
     denoiser_params = model.denoiser.count_parameters()
@@ -98,6 +113,7 @@ def main() -> None:
     print(f" - Frozen V0 Encoder Parameters: {encoder_params:,} (requires_grad = False)")
     print(f" - Trainable Denoiser Parameters: {denoiser_params:,}")
     print(f" - Active Corruption: Frame Dropout (p={cfg_corr.get('frame_dropout', {}).get('probability', 0.20):.2f})")
+    print(f" - Loss Weights: L_diff={cfg_loss.get('lambda_diff', 1.0)}, L_recon={cfg_loss.get('lambda_recon', 0.5)}, L_missing={cfg_loss.get('lambda_missing', 1.0)}")
     print("================================================================")
 
     # 3. Train Diffusion Denoiser
@@ -125,7 +141,8 @@ def main() -> None:
         results_dir=results_dir,
         device=device,
     )
-    eval_results = evaluator.evaluate_test_set(num_inference_steps=int(cfg_diff.get("timesteps", 50)))
+    inf_steps = int(cfg_diff.get("inference_steps", cfg_diff.get("timesteps", 50)))
+    eval_results = evaluator.evaluate_test_set(num_inference_steps=inf_steps)
 
     # Save summary JSON and Markdown report
     evaluator.generate_v1_report(train_results=train_summary, eval_results=eval_results, config=config)
@@ -148,10 +165,14 @@ def main() -> None:
     print(f"Reconstructed latent MSE:")
     print(f"{eval_results['reconstructed_latent_mse']:.6f}")
     print()
-    print(f"Improvement:")
-    print(f"{eval_results['improvement_percentage']:.2f} %")
+    print(f"Missing-frame corrupted MSE: {eval_results['corrupted_missing_mse']:.6f} -> Reconstructed MSE: {eval_results['reconstructed_missing_mse']:.6f}")
     print()
-    print(f"Best validation diffusion loss:")
+    print(f"Improvement (Full Sequence):")
+    print(f"{eval_results['improvement_percentage']:.2f} %")
+    print(f"Improvement (Missing Frames):")
+    print(f"{eval_results['missing_improvement_percentage']:.2f} %")
+    print()
+    print(f"Best validation reconstruction MSE:")
     print(f"{train_summary['best_val_rec_mse']:.6f}")
     print()
     print(f"Peak VRAM:")

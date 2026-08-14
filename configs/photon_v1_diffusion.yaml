@@ -1,6 +1,6 @@
 # ==============================================================================
 # PhotonShield AI - Phase V1.0 Latent Diffusion Configuration
-# Conditional Latent Temporal Reconstruction Baseline
+# Conditional Latent Temporal Reconstruction & Inpainting Baseline
 # ==============================================================================
 
 dataset:
@@ -27,6 +27,8 @@ diffusion:
   hidden_dim: 128
   num_blocks: 2
   timesteps: 50
+  beta_schedule: linear
+  inference_steps: 50
   prediction_type: epsilon
 
 corruption:
@@ -46,6 +48,11 @@ corruption:
 
   amplitude_scaling:
     enabled: false
+
+losses:
+  lambda_diff: 1.0
+  lambda_recon: 0.5
+  lambda_missing: 1.0
 
 training:
   batch_size: 16
