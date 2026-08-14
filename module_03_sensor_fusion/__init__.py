@@ -25,6 +25,11 @@ from module_03_sensor_fusion.quality_features import extract_quality_features
 from module_03_sensor_fusion.fusion import fuse_sensor_features
 from module_03_sensor_fusion.tokenization import SensorAwareTokenizer
 from module_03_sensor_fusion.pipeline import SensorFusionPipeline, FusionOutput
+from module_03_sensor_fusion.radical_adapter import (
+    RaDICaLDatasetAdapter,
+    RaDICaLDataset,
+    RaDICaLFeatureExtractor,
+)
 
 __all__ = [
     "Module3Config",
@@ -50,4 +55,7 @@ __all__ = [
     "SensorAwareTokenizer",
     "SensorFusionPipeline",
     "FusionOutput",
+    "RaDICaLDatasetAdapter",
+    "RaDICaLDataset",
+    "RaDICaLFeatureExtractor",
 ]

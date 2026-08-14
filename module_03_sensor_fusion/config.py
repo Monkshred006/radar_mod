@@ -98,6 +98,7 @@ class Module3Config:
     distance: DistanceFeatureConfig = field(default_factory=DistanceFeatureConfig)
     quality: QualityFeatureConfig = field(default_factory=QualityFeatureConfig)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
+    fusion_mode: Literal["simple", "attention"] = "simple"
     streaming: bool = False
     dtype: Literal["float32", "float64"] = "float32"
 
