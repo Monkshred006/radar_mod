@@ -1,6 +1,6 @@
-"""Trainer Engine for Latent Diffusion Model (PhotonShield AI V1.0).
+"""Trainer Engine for Latent Diffusion Model (PhotonShield AI V1).
 
-Trains the lightweight temporal denoiser while keeping the PhotonV0 encoder frozen.
+Logs component losses (diffusion, x0 reconstruction, missing-frame) and validation metrics.
 """
 
 from __future__ import annotations
@@ -21,30 +21,37 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from module_05_latent_diffusion.latent_diffusion import LatentDiffusionModel
+from module_05_latent_diffusion.losses import DiffusionLoss
 
 
 def plot_diffusion_curves(history: List[Dict[str, Any]], output_path: Path) -> None:
     """Plot diffusion training and reconstruction loss curves."""
     epochs = [h["epoch"] for h in history]
-    train_diff_loss = [h["train_diffusion_loss"] for h in history]
-    val_diff_loss = [h["val_diffusion_loss"] for h in history]
-    val_rec_mse = [h["val_reconstruction_mse"] for h in history]
+    train_total_loss = [h["train_total_loss"] for h in history]
+    train_diff_loss = [h["train_diff_loss"] for h in history]
+    train_missing_loss = [h["train_missing_loss"] for h in history]
+    val_rec_mse = [h["val_reconstructed_mse"] for h in history]
+    val_missing_mse = [h["val_missing_mse"] for h in history]
+    val_corr_mse = [h["val_corrupted_mse"] for h in history]
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
     fig.patch.set_facecolor("#ffffff")
 
-    # 1. Noise Prediction Loss
-    axes[0].plot(epochs, train_diff_loss, label="Train Noise MSE", color="#1f77b4", lw=2)
-    axes[0].plot(epochs, val_diff_loss, label="Val Noise MSE", color="#ff7f0e", lw=2, linestyle="--")
-    axes[0].set_title("Diffusion Noise Prediction Loss (MSE)", fontsize=11, fontweight="bold")
+    # 1. Training Component Losses
+    axes[0].plot(epochs, train_total_loss, label="Total Loss", color="#1f77b4", lw=2)
+    axes[0].plot(epochs, train_diff_loss, label="Noise Loss (L_diff)", color="#ff7f0e", lw=1.5, linestyle="--")
+    axes[0].plot(epochs, train_missing_loss, label="Missing Loss (L_miss)", color="#d62728", lw=1.5, linestyle=":")
+    axes[0].set_title("Training Component Losses", fontsize=11, fontweight="bold")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Loss")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
-    # 2. Latent Reconstruction Error
-    axes[1].plot(epochs, val_rec_mse, label="Val Reconstruction MSE", color="#2ca02c", lw=2)
-    axes[1].set_title("Latent Reconstruction MSE: MSE(Z_hat, Z_0)", fontsize=11, fontweight="bold")
+    # 2. Validation Imputation MSE
+    axes[1].plot(epochs, val_corr_mse, label="Corrupted Baseline MSE", color="#7f7f7f", lw=1.5, linestyle="--")
+    axes[1].plot(epochs, val_rec_mse, label="Full Reconstructed MSE", color="#2ca02c", lw=2)
+    axes[1].plot(epochs, val_missing_mse, label="Missing-Frame MSE", color="#9467bd", lw=2)
+    axes[1].set_title("Validation Latent Imputation MSE", fontsize=11, fontweight="bold")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("MSE")
     axes[1].grid(True, alpha=0.3)
@@ -91,52 +98,56 @@ class DiffusionTrainer:
         self.results_dir = Path("results/photon_v1")
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
-    def evaluate_epoch(self, dataloader: DataLoader, compute_full_reconstruction: bool = True) -> Tuple[float, float, float]:
-        """Evaluate diffusion noise loss and latent reconstruction MSE."""
+    def evaluate_epoch(self, dataloader: DataLoader, compute_full_reconstruction: bool = True) -> Dict[str, float]:
+        """Evaluate validation metrics across dataloader."""
         self.model.denoiser.eval()
-        total_diff_loss = 0.0
-        rec_mse_sum = 0.0
-        corrupted_mse_sum = 0.0
+
         total_samples = 0
+        total_corr_mse = 0.0
+        total_rec_mse = 0.0
+        total_missing_mse = 0.0
+        total_obs_mse = 0.0
 
         with torch.no_grad():
             for batch in dataloader:
                 x = batch["features"].to(self.device)
                 B = x.shape[0]
 
-                # 1. Diffusion noise prediction loss
-                diff_loss, z_0, z_c, _ = self.model(x)
-                total_diff_loss += diff_loss.item() * B
+                # Full conditional reconstruction
+                z_hat, z_0, z_c, mask = self.model.reconstruct(
+                    x=x,
+                    num_steps=min(20, self.model.timesteps),
+                )
 
-                # 2. Corrupted baseline MSE: MSE(Z_c, Z_0)
-                corrupted_mse = nn.functional.mse_loss(z_c, z_0).item()
-                corrupted_mse_sum += corrupted_mse * B
+                corr_metrics = DiffusionLoss.reconstruction_metrics(z_c, z_0, mask)
+                rec_metrics = DiffusionLoss.reconstruction_metrics(z_hat, z_0, mask)
 
-                # 3. Full reverse diffusion reconstruction MSE: MSE(Z_hat, Z_0)
-                if compute_full_reconstruction:
-                    z_hat = self.model.scheduler.reconstruct(
-                        denoiser=self.model.denoiser,
-                        condition=z_c,
-                        num_inference_steps=min(20, self.model.timesteps),
-                    )
-                    rec_mse = nn.functional.mse_loss(z_hat, z_0).item()
-                    rec_mse_sum += rec_mse * B
-
+                total_corr_mse += corr_metrics["full_mse"] * B
+                total_rec_mse += rec_metrics["full_mse"] * B
+                total_missing_mse += rec_metrics["missing_mse"] * B
+                total_obs_mse += rec_metrics["observed_mse"] * B
                 total_samples += B
 
-        mean_diff_loss = total_diff_loss / max(total_samples, 1)
-        mean_corrupted_mse = corrupted_mse_sum / max(total_samples, 1)
-        mean_rec_mse = (rec_mse_sum / max(total_samples, 1)) if compute_full_reconstruction else mean_diff_loss
+        mean_corr = total_corr_mse / max(total_samples, 1)
+        mean_rec = total_rec_mse / max(total_samples, 1)
+        mean_miss = total_missing_mse / max(total_samples, 1)
+        mean_obs = total_obs_mse / max(total_samples, 1)
+        improvement = 100.0 * (mean_corr - mean_rec) / max(mean_corr, 1e-8)
 
-        return mean_diff_loss, mean_corrupted_mse, mean_rec_mse
+        return {
+            "corrupted_mse": mean_corr,
+            "reconstructed_mse": mean_rec,
+            "missing_mse": mean_miss,
+            "observed_mse": mean_obs,
+            "improvement": improvement,
+        }
 
     def train(self) -> Dict[str, Any]:
         """Run full training loop with early stopping."""
-        print(f"[DiffusionTrainer] Training lightweight denoiser on device: {self.device}")
+        print(f"[DiffusionTrainer] Training on device: {self.device}")
         print(f"[DiffusionTrainer] Trainable Denoiser Parameters: {self.model.denoiser.count_parameters():,}")
         print(f"[DiffusionTrainer] Frozen Encoder Parameters: {sum(p.numel() for p in self.model.encoder.parameters()):,}")
 
-        # Reset peak VRAM tracker
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 
@@ -149,14 +160,20 @@ class DiffusionTrainer:
         csv_path = self.results_dir / "metrics.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "train_diffusion_loss", "val_diffusion_loss", "val_corrupted_mse", "val_reconstruction_mse", "lr"])
+            writer.writerow([
+                "epoch", "train_total_loss", "train_diff_loss", "train_recon_loss", "train_missing_loss",
+                "val_corrupted_mse", "val_reconstructed_mse", "val_missing_mse", "val_observed_mse", "val_improvement", "lr"
+            ])
 
         t_start = time.perf_counter()
         batch_latencies = []
 
         for epoch in range(1, self.epochs + 1):
             self.model.denoiser.train()
-            train_diff_loss = 0.0
+            sum_total_loss = 0.0
+            sum_diff_loss = 0.0
+            sum_recon_loss = 0.0
+            sum_missing_loss = 0.0
             total_train_samples = 0
 
             for batch in self.train_loader:
@@ -168,14 +185,14 @@ class DiffusionTrainer:
 
                 if self.use_amp:
                     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                        loss, _, _, _ = self.model(x)
+                        loss, loss_dict, _, _, _, _ = self.model(x)
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.denoiser.parameters(), max_norm=1.0)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
-                    loss, _, _, _ = self.model(x)
+                    loss, loss_dict, _, _, _, _ = self.model(x)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.denoiser.parameters(), max_norm=1.0)
                     self.optimizer.step()
@@ -184,22 +201,34 @@ class DiffusionTrainer:
                     torch.cuda.synchronize()
                 batch_latencies.append((time.perf_counter() - t0) * 1000.0)
 
-                train_diff_loss += loss.item() * B
+                sum_total_loss += loss.item() * B
+                sum_diff_loss += loss_dict["diff_loss"] * B
+                sum_recon_loss += loss_dict["recon_loss"] * B
+                sum_missing_loss += loss_dict["missing_loss"] * B
                 total_train_samples += B
 
             curr_lr = float(self.scheduler.get_last_lr()[0])
             self.scheduler.step()
-            train_diff_loss /= max(total_train_samples, 1)
+
+            mean_train_total = sum_total_loss / max(total_train_samples, 1)
+            mean_train_diff = sum_diff_loss / max(total_train_samples, 1)
+            mean_train_recon = sum_recon_loss / max(total_train_samples, 1)
+            mean_train_missing = sum_missing_loss / max(total_train_samples, 1)
 
             # Validation
-            val_diff_loss, val_corr_mse, val_rec_mse = self.evaluate_epoch(self.val_loader, compute_full_reconstruction=True)
+            val_metrics = self.evaluate_epoch(self.val_loader, compute_full_reconstruction=True)
 
             row = {
                 "epoch": epoch,
-                "train_diffusion_loss": round(train_diff_loss, 5),
-                "val_diffusion_loss": round(val_diff_loss, 5),
-                "val_corrupted_mse": round(val_corr_mse, 5),
-                "val_reconstruction_mse": round(val_rec_mse, 5),
+                "train_total_loss": round(mean_train_total, 5),
+                "train_diff_loss": round(mean_train_diff, 5),
+                "train_recon_loss": round(mean_train_recon, 5),
+                "train_missing_loss": round(mean_train_missing, 5),
+                "val_corrupted_mse": round(val_metrics["corrupted_mse"], 5),
+                "val_reconstructed_mse": round(val_metrics["reconstructed_mse"], 5),
+                "val_missing_mse": round(val_metrics["missing_mse"], 5),
+                "val_observed_mse": round(val_metrics["observed_mse"], 5),
+                "val_improvement": round(val_metrics["improvement"], 2),
                 "lr": curr_lr,
             }
             history.append(row)
@@ -207,21 +236,24 @@ class DiffusionTrainer:
             # Append to CSV
             with open(csv_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow([epoch, row["train_diffusion_loss"], row["val_diffusion_loss"], row["val_corrupted_mse"], row["val_reconstruction_mse"], row["lr"]])
+                writer.writerow([
+                    epoch, row["train_total_loss"], row["train_diff_loss"], row["train_recon_loss"], row["train_missing_loss"],
+                    row["val_corrupted_mse"], row["val_reconstructed_mse"], row["val_missing_mse"], row["val_observed_mse"], row["val_improvement"], row["lr"]
+                ])
 
             print(
                 f"Epoch [{epoch:02d}/{self.epochs:02d}] "
-                f"Train Loss: {train_diff_loss:.5f} | Val Loss: {val_diff_loss:.5f} | "
-                f"Val Base MSE: {val_corr_mse:.5f} -> Reconstructed MSE: {val_rec_mse:.5f}"
+                f"Train Total: {mean_train_total:.4f} (Diff: {mean_train_diff:.4f}, Rec: {mean_train_recon:.4f}, Miss: {mean_train_missing:.4f}) | "
+                f"Val Base MSE: {val_metrics['corrupted_mse']:.4f} -> Rec MSE: {val_metrics['reconstructed_mse']:.4f} (Miss: {val_metrics['missing_mse']:.4f}, Imprv: {val_metrics['improvement']:.1f}%)"
             )
 
-            # Save Best Model Checkpoint
-            if val_rec_mse < best_val_rec_mse:
-                best_val_rec_mse = val_rec_mse
+            # Save Best Checkpoint based on Validation Reconstruction MSE
+            if val_metrics["reconstructed_mse"] < best_val_rec_mse:
+                best_val_rec_mse = val_metrics["reconstructed_mse"]
                 best_epoch = epoch
                 patience_counter = 0
                 torch.save(self.model.denoiser.state_dict(), self.checkpoint_dir / "best_diffusion.pt")
-                print(f"  --> Saved new best diffusion checkpoint at epoch {epoch} (Val Rec MSE: {val_rec_mse:.5f})")
+                print(f"  --> Saved new best diffusion checkpoint at epoch {epoch} (Val Rec MSE: {best_val_rec_mse:.5f})")
             else:
                 patience_counter += 1
                 if patience_counter >= self.patience:
@@ -231,10 +263,8 @@ class DiffusionTrainer:
         total_time = time.perf_counter() - t_start
         torch.save(self.model.denoiser.state_dict(), self.checkpoint_dir / "last_diffusion.pt")
 
-        # Plot curves
         plot_diffusion_curves(history, self.results_dir / "diffusion_training_curve.png")
 
-        # Peak VRAM & batch latency
         peak_vram_gb = round(torch.cuda.max_memory_allocated(self.device) / (1024**3), 4) if self.device.type == "cuda" else 0.0
         avg_batch_lat = float(np.mean(batch_latencies)) if batch_latencies else 0.0
 

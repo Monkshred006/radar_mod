@@ -1,11 +1,12 @@
-"""Evaluator Engine for Latent Diffusion Model (PhotonShield AI V1.0).
+"""Evaluator Engine for Latent Diffusion Model (PhotonShield AI V1).
 
-Performs baseline vs. reconstructed MSE comparison, PCA visualizations, and report generation.
+Performs missing-frame vs. observed-frame MSE/MAE/RMSE comparison, PCA visualizations, and report generation.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import matplotlib
@@ -18,6 +19,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from module_05_latent_diffusion.latent_diffusion import LatentDiffusionModel
+from module_05_latent_diffusion.losses import DiffusionLoss
 
 
 class DiffusionEvaluator:
@@ -39,51 +41,91 @@ class DiffusionEvaluator:
     def evaluate_test_set(self, num_inference_steps: int = 50) -> Dict[str, Any]:
         """Run full evaluation on the unseen test set."""
         self.model.denoiser.eval()
-        
+
         all_z0 = []
         all_zc = []
         all_zhat = []
+        all_masks = []
 
-        total_corrupted_mse = 0.0
-        total_reconstructed_mse = 0.0
         total_samples = 0
+        total_corr_full_mse = 0.0
+        total_rec_full_mse = 0.0
+        total_rec_full_mae = 0.0
+
+        total_corr_missing_mse = 0.0
+        total_rec_missing_mse = 0.0
+        total_rec_missing_mae = 0.0
+
+        total_rec_obs_mse = 0.0
+        total_rec_obs_mae = 0.0
 
         with torch.no_grad():
             for batch in self.test_loader:
                 x = batch["features"].to(self.device)
                 B = x.shape[0]
 
-                # Run reverse diffusion reconstruction
-                z_hat, z_0, z_c = self.model.reconstruct(x=x, num_steps=num_inference_steps)
+                # Run reverse diffusion reconstruction with data-consistency inpainting
+                z_hat, z_0, z_c, mask = self.model.reconstruct(x=x, num_steps=num_inference_steps)
 
-                corr_mse = nn.functional.mse_loss(z_c, z_0).item()
-                rec_mse = nn.functional.mse_loss(z_hat, z_0).item()
+                corr_metrics = DiffusionLoss.reconstruction_metrics(z_c, z_0, mask)
+                rec_metrics = DiffusionLoss.reconstruction_metrics(z_hat, z_0, mask)
 
-                total_corrupted_mse += corr_mse * B
-                total_reconstructed_mse += rec_mse * B
+                total_corr_full_mse += corr_metrics["full_mse"] * B
+                total_rec_full_mse += rec_metrics["full_mse"] * B
+                total_rec_full_mae += rec_metrics["full_mae"] * B
+
+                total_corr_missing_mse += corr_metrics["missing_mse"] * B
+                total_rec_missing_mse += rec_metrics["missing_mse"] * B
+                total_rec_missing_mae += rec_metrics["missing_mae"] * B
+
+                total_rec_obs_mse += rec_metrics["observed_mse"] * B
+                total_rec_obs_mae += rec_metrics["observed_mae"] * B
+
                 total_samples += B
 
                 all_z0.append(z_0.cpu().numpy())
                 all_zc.append(z_c.cpu().numpy())
                 all_zhat.append(z_hat.cpu().numpy())
+                all_masks.append(mask.cpu().numpy())
 
-        mean_corr_mse = total_corrupted_mse / max(total_samples, 1)
-        mean_rec_mse = total_reconstructed_mse / max(total_samples, 1)
-        
-        improvement_pct = 100.0 * (mean_corr_mse - mean_rec_mse) / max(mean_corr_mse, 1e-8)
-        gate_passed = bool(mean_rec_mse < mean_corr_mse)
+        mean_corr_full_mse = total_corr_full_mse / max(total_samples, 1)
+        mean_rec_full_mse = total_rec_full_mse / max(total_samples, 1)
+        mean_rec_full_mae = total_rec_full_mae / max(total_samples, 1)
+        mean_rec_full_rmse = math.sqrt(mean_rec_full_mse)
+
+        mean_corr_missing_mse = total_corr_missing_mse / max(total_samples, 1)
+        mean_rec_missing_mse = total_rec_missing_mse / max(total_samples, 1)
+        mean_rec_missing_mae = total_rec_missing_mae / max(total_samples, 1)
+        mean_rec_missing_rmse = math.sqrt(mean_rec_missing_mse)
+
+        mean_rec_obs_mse = total_rec_obs_mse / max(total_samples, 1)
+        mean_rec_obs_mae = total_rec_obs_mae / max(total_samples, 1)
+        mean_rec_obs_rmse = math.sqrt(mean_rec_obs_mse)
+
+        full_imprv = 100.0 * (mean_corr_full_mse - mean_rec_full_mse) / max(mean_corr_full_mse, 1e-8)
+        missing_imprv = 100.0 * (mean_corr_missing_mse - mean_rec_missing_mse) / max(mean_corr_missing_mse, 1e-8)
+        gate_passed = bool(mean_rec_full_mse < mean_corr_full_mse and mean_rec_missing_mse < mean_corr_missing_mse)
 
         z0_arr = np.concatenate(all_z0, axis=0)      # [N, T, D]
         zc_arr = np.concatenate(all_zc, axis=0)      # [N, T, D]
         zhat_arr = np.concatenate(all_zhat, axis=0)  # [N, T, D]
 
-        # Generate PCA Visualizations
         self.generate_pca_plots(z0_arr, zc_arr, zhat_arr)
 
         return {
-            "corrupted_latent_mse": round(mean_corr_mse, 6),
-            "reconstructed_latent_mse": round(mean_rec_mse, 6),
-            "improvement_percentage": round(improvement_pct, 2),
+            "corrupted_latent_mse": round(mean_corr_full_mse, 6),
+            "reconstructed_latent_mse": round(mean_rec_full_mse, 6),
+            "reconstructed_latent_mae": round(mean_rec_full_mae, 6),
+            "reconstructed_latent_rmse": round(mean_rec_full_rmse, 6),
+            "corrupted_missing_mse": round(mean_corr_missing_mse, 6),
+            "reconstructed_missing_mse": round(mean_rec_missing_mse, 6),
+            "reconstructed_missing_mae": round(mean_rec_missing_mae, 6),
+            "reconstructed_missing_rmse": round(mean_rec_missing_rmse, 6),
+            "reconstructed_observed_mse": round(mean_rec_obs_mse, 6),
+            "reconstructed_observed_mae": round(mean_rec_obs_mae, 6),
+            "reconstructed_observed_rmse": round(mean_rec_obs_rmse, 6),
+            "improvement_percentage": round(full_imprv, 2),
+            "missing_improvement_percentage": round(missing_imprv, 2),
             "gate_passed": gate_passed,
             "total_test_samples": total_samples,
         }
@@ -159,6 +201,7 @@ class DiffusionEvaluator:
         cfg_diff = config.get("diffusion", {})
         cfg_train = config.get("training", {})
         cfg_corr = config.get("corruption", {})
+        cfg_loss = config.get("losses", {})
 
         gate_status = "PASS" if eval_results["gate_passed"] else "FAIL"
         next_stage = "V1.1 JOINT PERCEPTION" if eval_results["gate_passed"] else "INVESTIGATE DIFFUSION"
@@ -166,7 +209,7 @@ class DiffusionEvaluator:
         report_lines = [
             "# PhotonShield AI — Phase V1.0 Latent Diffusion Baseline Report",
             "",
-            "**Version**: `Phase V1.0 (Latent Reconstruction Baseline)`  ",
+            "**Version**: `Phase V1.0 (Latent Reconstruction & Imputation)`  ",
             "**Date**: 2026-08-15  ",
             "**Target Hardware**: NVIDIA GeForce RTX 5050 Laptop GPU (8GB VRAM) & Arduino UNO Q  ",
             f"**Status**: **{gate_status}**  ",
@@ -177,16 +220,16 @@ class DiffusionEvaluator:
             "",
             "> *\"Latent diffusion can reconstruct corrupted or missing temporal radar information and improve the robustness of lightweight Mamba-based radar perception.\"*",
             "",
-            "In Phase V1.0, conditional latent diffusion is evaluated strictly as an isolated latent reconstruction module operating on the frozen representations of the PhotonV0 temporal foundation.",
+            "Conditional latent diffusion performs temporal imputation by preserving observed frames through data-consistency projection while reconstructing missing frames via reverse denoising.",
             "",
             "---",
             "",
             "## 2. Architecture Overview",
             "",
             "* **Frozen Backbone**: PhotonV0 Encoder (2-layer Mini-Mamba, D=64, H=64, 70,566 frozen parameters).",
-            f"* **Trainable Denoiser**: `LightweightDenoiser` (Sinusoidal timestep embedding + 2 Temporal Convolution Residual Blocks + Input/Output Linear Projections).",
+            "* **Trainable Denoiser**: `LightweightDenoiser` (Input projection 129 -> 128 with explicit mask conditioning, 2 Temporal Residual Blocks, 128 -> 64 output projection).",
             f"* **Denoiser Parameter Count**: {self.model.denoiser.count_parameters():,} parameters.",
-            "* **Diffusion Type**: DDPM conditional noise prediction (eps_theta(z_t, z_c, t)).",
+            "* **Diffusion Type**: Conditional DDPM with inpainting data consistency.",
             f"* **Diffusion Timesteps**: {cfg_diff.get('timesteps', 50)} steps.",
             "",
             "---",
@@ -210,30 +253,31 @@ class DiffusionEvaluator:
             "",
             "## 5. Corruption Model",
             "",
-            "* **Corruption Type**: **Temporal Frame Dropout**",
-            f"* **Dropout Probability**: p = {cfg_corr.get('frame_dropout', {}).get('probability', 0.20):.2f} (20% of temporal frames randomly zeroed out).",
-            "* **Other Corruptions**: Disabled for Phase V1.0 baseline.",
+            "* **Corruption Type**: **Temporal Frame Dropout with Explicit Binary Mask**",
+            f"* **Dropout Probability**: p = {cfg_corr.get('frame_dropout', {}).get('probability', 0.20):.2f} (20% of temporal frames randomly missing).",
             "",
             "---",
             "",
-            "## 6. Training Configuration",
+            "## 6. Training & Loss Configuration",
             "",
             f"* **Batch Size**: {cfg_train.get('batch_size', 16)}",
             f"* **Max Epochs**: {train_results.get('epochs', 50)} (Best Epoch: {train_results.get('best_epoch', 0)})",
             f"* **Learning Rate**: {cfg_train.get('learning_rate', 5e-4)} (Cosine Annealing scheduler)",
             "* **Optimizer**: AdamW (weight decay = 1e-4)",
+            f"* **Loss Weights**: lambda_diff = {cfg_loss.get('lambda_diff', 1.0)}, lambda_recon = {cfg_loss.get('lambda_recon', 0.5)}, lambda_missing = {cfg_loss.get('lambda_missing', 1.0)}",
             "* **Precision**: Mixed Precision (Float16 Autocast + GradScaler on CUDA)",
             "",
             "---",
             "",
             "## 7. Reconstruction Performance & Hypothesis Validation",
             "",
-            "| Metric | Measured Score | Target Condition |",
-            "| :--- | :---: | :---: |",
-            f"| **Baseline Corrupted Latent MSE: MSE(Z_c, Z)** | **{eval_results['corrupted_latent_mse']:.6f}** | Reference Baseline |",
-            f"| **Reconstructed Latent MSE: MSE(Z_hat, Z)** | **{eval_results['reconstructed_latent_mse']:.6f}** | **< MSE(Z_c, Z)** |",
-            f"| **Reconstruction Error Reduction** | **{eval_results['improvement_percentage']:.2f}%** | **> 0.0%** |",
-            f"| **Best Validation Diffusion Loss** | **{train_results.get('best_val_rec_mse', 0.0):.6f}** | Finite / Converged |",
+            "| Metric | Corrupted Baseline | Reconstructed Output | Error Reduction (%) |",
+            "| :--- | :---: | :---: | :---: |",
+            f"| **Full Sequence MSE** | **{eval_results['corrupted_latent_mse']:.6f}** | **{eval_results['reconstructed_latent_mse']:.6f}** | **{eval_results['improvement_percentage']:.2f}%** |",
+            f"| **Missing-Frame MSE** | **{eval_results['corrupted_missing_mse']:.6f}** | **{eval_results['reconstructed_missing_mse']:.6f}** | **{eval_results['missing_improvement_percentage']:.2f}%** |",
+            f"| **Observed-Frame MSE** | **0.000000** | **{eval_results['reconstructed_observed_mse']:.6f}** | Preserved (Data Consistency) |",
+            f"| **Full Sequence MAE / RMSE** | — | **{eval_results['reconstructed_latent_mae']:.6f} / {eval_results['reconstructed_latent_rmse']:.6f}** | — |",
+            f"| **Missing-Frame MAE / RMSE** | — | **{eval_results['reconstructed_missing_mae']:.6f} / {eval_results['reconstructed_missing_rmse']:.6f}** | — |",
             "",
             "---",
             "",
@@ -247,15 +291,15 @@ class DiffusionEvaluator:
             "",
             "## 9. Limitations",
             "",
-            "1. **Isolated Latent Reconstruction**: V1.0 only optimizes L_noise = MSE(eps_hat, eps) and does not backpropagate task classification gradients.",
-            "2. **Deterministic Sampler Speed**: Full 50-step DDPM sampling requires multi-step iterative loops, which will be accelerated via DDIM / 1-step direct approximation in subsequent stages.",
+            "1. **Isolated Latent Reconstruction**: V1.0 optimizes diffusion imputation on frozen latents without end-to-end task classification gradients.",
+            "2. **Inference Steps**: Full 50-step DDPM sampling provides high reconstruction quality; single-step or few-step DDIM can be used for ultra-low latency.",
             "",
             "---",
             "",
             "## 10. Pass / Fail Decision & Next Step",
             "",
             f"* **V1.0 Decision**: **{gate_status}**",
-            f"* **Gate Verification**: MSE(Z_hat, Z) < MSE(Z_c, Z) verified with **{eval_results['improvement_percentage']:.2f}%** reconstruction error reduction.",
+            f"* **Gate Verification**: Full MSE improved by **{eval_results['improvement_percentage']:.2f}%** and missing-frame MSE improved by **{eval_results['missing_improvement_percentage']:.2f}%**.",
             f"* **Next Stage**: **{next_stage}**",
         ]
 
