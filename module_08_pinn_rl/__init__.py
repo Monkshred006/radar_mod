@@ -54,7 +54,13 @@ from module_08_pinn_rl.rl_algorithm import PPO
 from module_08_pinn_rl.rl_policy import MLPPolicy
 from module_08_pinn_rl.state import RLState, RLStateBuilder
 from module_08_pinn_rl.training import PINNTrainer, RLTrainer, StagedTrainer
-from module_08_pinn_rl.transitions import Episode, Transition
+from module_08_pinn_rl.interfaces import PhysicsConstraint
+from module_08_pinn_rl.physics_losses import (
+    NonNegativeSignalEnergyLoss,
+    TemporalSmoothnessLoss,
+    BoundedReflectionLoss,
+)
+from module_08_pinn_rl.pinn_constraints import CompositePhysicsConstraint
 
 __all__ = [
     # Configurations
@@ -80,6 +86,11 @@ __all__ = [
     "build_physics_model",
     "compute_kinematic_residual",
     "compute_wave_convection_residual",
+    "PhysicsConstraint",
+    "NonNegativeSignalEnergyLoss",
+    "TemporalSmoothnessLoss",
+    "BoundedReflectionLoss",
+    "CompositePhysicsConstraint",
     # Dynamics & PINN Loss
     "PhysicsInformedDynamicsModel",
     "PINNLoss",
