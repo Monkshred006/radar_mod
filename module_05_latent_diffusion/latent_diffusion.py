@@ -1,7 +1,7 @@
 """Top-level Latent Diffusion Model for PhotonShield AI V1.
 
-Binds the frozen PhotonV0 encoder, conditional temporal denoiser, DDPM scheduler,
-and radar corruption operators.
+Binds the frozen PhotonV0 encoder, conditional temporal denoiser with mask conditioning,
+DDPM scheduler with data-consistency inpainting, and radar corruption operators.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from typing import Dict, Any, Optional, Tuple, Union
 from pathlib import Path
 import torch
 import torch.nn as nn
-import yaml
 
 from module_04_mamba_hybrid.photon_v0 import PhotonV0
 from module_05_latent_diffusion.denoiser import LightweightDenoiser
@@ -29,7 +28,9 @@ class LatentDiffusionModel(nn.Module):
         hidden_dim: int = 128,
         num_blocks: int = 2,
         timesteps: int = 50,
+        beta_schedule: str = "linear",
         corruption_config: Optional[Dict[str, Any]] = None,
+        loss_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -60,7 +61,7 @@ class LatentDiffusionModel(nn.Module):
         for p in self.encoder.parameters():
             p.requires_grad = False
 
-        # 2. Trainable Lightweight Denoiser
+        # 2. Trainable Lightweight Denoiser with mask conditioning
         self.denoiser = LightweightDenoiser(
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
@@ -68,13 +69,21 @@ class LatentDiffusionModel(nn.Module):
         )
 
         # 3. Diffusion Noise Scheduler
-        self.scheduler = DDPMScheduler(num_train_timesteps=timesteps)
+        self.scheduler = DDPMScheduler(
+            num_train_timesteps=timesteps,
+            beta_schedule=beta_schedule,
+        )
 
         # 4. Latent State Corruption Pipeline
         self.corruption = RadarLatentCorruption(corruption_config)
 
         # 5. Loss Module
-        self.loss_fn = DiffusionLoss()
+        lcfg = loss_config or {}
+        self.loss_fn = DiffusionLoss(
+            lambda_diff=float(lcfg.get("lambda_diff", 1.0)),
+            lambda_recon=float(lcfg.get("lambda_recon", 0.5)),
+            lambda_missing=float(lcfg.get("lambda_missing", 1.0)),
+        )
 
     def count_parameters(self, trainable_only: bool = True) -> int:
         """Return parameter count."""
@@ -93,21 +102,23 @@ class LatentDiffusionModel(nn.Module):
         self,
         x: torch.Tensor,
         z_c: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute diffusion training step loss.
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute composite diffusion training step loss without leaking clean z_0 to denoiser.
 
         Args:
             x: Raw radar feature batch [B, T, 64].
-            z_c: Optional pre-corrupted latent tensor [B, T, 64]. If None, corrupted via self.corruption.
+            z_c: Optional pre-corrupted latent tensor [B, T, 64].
+            mask: Optional observation mask [B, T, 1].
 
         Returns:
-            Tuple of (loss, z_0, z_c, eps_pred)
+            Tuple of (total_loss, loss_dict, z_0, z_c, mask, eps_pred).
         """
         # 1. Extract clean latent z_0 using frozen encoder
         with torch.no_grad():
             z_0 = self.encode(x)
-            if z_c is None:
-                z_c = self.corruption(z_0)
+            if z_c is None or mask is None:
+                z_c, mask = self.corruption(z_0)
 
         # 2. Sample random timesteps uniformly
         B = z_0.shape[0]
@@ -120,39 +131,53 @@ class LatentDiffusionModel(nn.Module):
         # 4. Add noise to clean latent according to schedule
         z_t = self.scheduler.add_noise(original_samples=z_0, noise=epsilon, timesteps=t)
 
-        # 5. Predict noise using conditional denoiser
-        eps_pred = self.denoiser(z_t=z_t, condition=z_c, timestep=t)
+        # 5. Predict noise using conditional denoiser (receives only z_t, z_c, mask, t - NO z_0)
+        eps_pred = self.denoiser(z_t=z_t, condition=z_c, timestep=t, mask=mask)
 
-        # 6. Compute MSE noise loss
-        loss = self.loss_fn(eps_pred, epsilon)
+        # 6. Predict clean latent z0_hat from predicted noise
+        z0_hat = self.scheduler.predict_z0_from_eps(z_t=z_t, eps_pred=eps_pred, timesteps=t)
 
-        return loss, z_0, z_c, eps_pred
+        # 7. Compute composite loss with SNR-weighting
+        sqrt_alpha = self.scheduler.sqrt_alphas_cumprod[t].view(-1, 1, 1)
+        total_loss, loss_dict = self.loss_fn(
+            eps_pred=eps_pred,
+            eps_target=epsilon,
+            z0_hat=z0_hat,
+            z0_target=z_0,
+            mask=mask,
+            sqrt_alphas_cumprod=sqrt_alpha,
+        )
+
+        return total_loss, loss_dict, z_0, z_c, mask, eps_pred
 
     @torch.no_grad()
     def reconstruct(
         self,
         x: torch.Tensor,
         z_c: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
         num_steps: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reconstruct clean latent state z_hat from input or corrupted state.
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reconstruct clean latent state z_hat from input with data consistency.
 
         Args:
             x: Input radar tensor [B, T, 64].
-            z_c: Optional pre-corrupted latent tensor.
+            z_c: Optional pre-corrupted latent tensor [B, T, 64].
+            mask: Optional observation mask [B, T, 1].
             num_steps: Denoising steps.
 
         Returns:
-            Tuple of (z_hat, z_0, z_c)
+            Tuple of (z_hat, z_0, z_c, mask).
         """
         z_0 = self.encode(x)
-        if z_c is None:
-            z_c = self.corruption(z_0)
+        if z_c is None or mask is None:
+            z_c, mask = self.corruption(z_0)
 
         z_hat = self.scheduler.reconstruct(
             denoiser=self.denoiser,
             condition=z_c,
+            mask=mask,
             num_inference_steps=num_steps or self.timesteps,
         )
 
-        return z_hat, z_0, z_c
+        return z_hat, z_0, z_c, mask
