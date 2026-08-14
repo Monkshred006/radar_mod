@@ -1,7 +1,7 @@
 """PhotonShield AI Phase V2 Physics-Informed Module.
 
 Provides calibrated radar physical constants, differentiable observable extractors,
-FMCW mapping equations, and physics regularizers.
+FMCW mapping equations, lightweight latent physics heads, and physics regularizers.
 """
 
 from module_06_physics.radar_constants import (
@@ -21,6 +21,7 @@ from module_06_physics.radar_constants import (
     FRAME_RATE_HZ,
 )
 from module_06_physics.observable_extractor import RadarObservableExtractor
+from module_06_physics.latent_physics_head import LatentPhysicsHead
 from module_06_physics.fmcw_model import (
     velocity_to_doppler_shift,
     doppler_shift_to_velocity,
@@ -48,6 +49,7 @@ __all__ = [
     "DT",
     "FRAME_RATE_HZ",
     "RadarObservableExtractor",
+    "LatentPhysicsHead",
     "velocity_to_doppler_shift",
     "doppler_shift_to_velocity",
     "range_to_beat_frequency",

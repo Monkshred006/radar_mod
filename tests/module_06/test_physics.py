@@ -18,6 +18,7 @@ from module_06_physics.radar_constants import (
     DT,
 )
 from module_06_physics.observable_extractor import RadarObservableExtractor
+from module_06_physics.latent_physics_head import LatentPhysicsHead
 from module_06_physics.fmcw_model import (
     velocity_to_doppler_shift,
     doppler_shift_to_velocity,
@@ -45,46 +46,48 @@ class TestPhysicsModule:
         r_rec = beat_frequency_to_range(f_b)
         assert torch.allclose(r_test, r_rec, atol=1e-5), "Range <-> Beat frequency inversion failed"
 
-    def test_2_range_observable_extractor(self):
-        """Verify range observable extraction on synthetic peaked profile."""
+    def test_2_raw_observable_extractor_accuracy(self):
+        """Verify raw observable extraction on synthetic peaked profile."""
         extractor = RadarObservableExtractor(temperature=0.01)
         B, T = 2, 4
-        # Create profile peaked at bin index 10 (out of 30 bins: R = 10 * 15 / 29 ≈ 5.17 m)
-        target_bin = 10
-        expected_r = float(MIN_RANGE + target_bin * (MAX_RANGE - MIN_RANGE) / 29.0)
+        target_bin_r = 10
+        expected_r = float(MIN_RANGE + target_bin_r * (MAX_RANGE - MIN_RANGE) / 29.0)
 
-        profile = torch.full((B, T, 30), -10.0)
-        profile[:, :, target_bin] = 10.0  # sharp peak
+        prof_r = torch.full((B, T, 30), -10.0)
+        prof_r[:, :, target_bin_r] = 10.0
+        r_hat = extractor.extract_range(prof_r)
+        assert torch.allclose(r_hat, torch.tensor(expected_r), atol=0.05)
 
-        r_hat = extractor.extract_range(profile)
-        assert r_hat.shape == (B, T)
-        assert torch.allclose(r_hat, torch.tensor(expected_r), atol=0.05), (
-            f"Extracted range {r_hat[0, 0]} does not match expected {expected_r}"
-        )
+        target_bin_v = 18
+        expected_v = float(MIN_VELOCITY + target_bin_v * (MAX_VELOCITY - MIN_VELOCITY) / 29.0)
+        prof_v = torch.full((B, T, 30), -10.0)
+        prof_v[:, :, target_bin_v] = 10.0
+        v_hat = extractor.extract_velocity(prof_v)
+        assert torch.allclose(v_hat, torch.tensor(expected_v), atol=0.05)
 
-    def test_3_velocity_observable_extractor(self):
-        """Verify velocity observable extraction on synthetic peaked profile."""
-        extractor = RadarObservableExtractor(temperature=0.01)
-        B, T = 2, 4
-        # Create profile peaked at bin index 18 (out of 30 bins: v = -8.32 + 18 * 16.64 / 29 ≈ 2.01 m/s)
-        target_bin = 18
-        expected_v = float(MIN_VELOCITY + target_bin * (MAX_VELOCITY - MIN_VELOCITY) / 29.0)
+    def test_3_latent_physics_head_shapes_and_bounds(self):
+        """Verify LatentPhysicsHead output shapes, range bounds, and velocity bounds."""
+        head = LatentPhysicsHead(latent_dim=64, hidden_dim=32)
+        B, T = 4, 16
+        z_random = torch.randn(B, T, 64) * 10.0  # large random values to test bounds
 
-        profile = torch.full((B, T, 30), -10.0)
-        profile[:, :, target_bin] = 10.0
+        obs = head(z_random)
+        r = obs["range"]
+        v = obs["velocity"]
+        e = obs["energy"]
 
-        v_hat = extractor.extract_velocity(profile)
-        assert v_hat.shape == (B, T)
-        assert torch.allclose(v_hat, torch.tensor(expected_v), atol=0.05), (
-            f"Extracted velocity {v_hat[0, 0]} does not match expected {expected_v}"
-        )
+        assert r.shape == (B, T), f"Range shape mismatch: {r.shape}"
+        assert v.shape == (B, T), f"Velocity shape mismatch: {v.shape}"
+        assert e.shape == (B, T), f"Energy shape mismatch: {e.shape}"
+
+        assert (r >= MIN_RANGE - 1e-4).all() and (r <= MAX_RANGE + 1e-4).all(), "Range out of physical bounds [0, 15m]"
+        assert (v >= MIN_VELOCITY - 1e-4).all() and (v <= MAX_VELOCITY + 1e-4).all(), "Velocity out of physical bounds [-8.32, 8.32 m/s]"
 
     def test_4_kinematic_loss_exact_motion(self):
         """Verify kinematic loss is zero for a trajectory obeying dR/dt = v."""
         physics_loss = RadarPhysicsLoss(dt=DT, velocity_sign=1)
         B, T = 2, 8
         v_const = 3.0  # m/s
-        # R(t) = R_0 + v * t * dt
         r_trajectory = 2.0 + v_const * torch.arange(T, dtype=torch.float32).unsqueeze(0).expand(B, T) * DT
         v_trajectory = torch.full((B, T), v_const, dtype=torch.float32)
 
@@ -141,13 +144,16 @@ class TestPhysicsModule:
         assert report["out_of_range_range"] is False
         assert report["out_of_range_velocity"] is False
 
-    def test_9_deterministic_physics_calculation(self):
-        """Verify physics calculation is strictly deterministic."""
-        physics_loss = RadarPhysicsLoss(dt=DT)
+    def test_9_no_leakage_and_deterministic_physics(self):
+        """Verify deterministic physics calculation and inference path isolation."""
+        head = LatentPhysicsHead(latent_dim=64, hidden_dim=32)
+        physics_loss = RadarPhysicsLoss(dt=DT, physics_head=head)
         z_latent = torch.randn(4, 16, 64)
 
+        # Inference path (z only, no x_clean)
         loss1, comp1 = physics_loss(z_latent)
         loss2, comp2 = physics_loss(z_latent)
 
         diff = float(abs(loss1.item() - loss2.item()))
         assert diff == 0.0, f"Non-deterministic physics loss output: diff = {diff}"
+        assert comp1["loss_alignment"].item() == 0.0, "Supervised alignment leaked into unsupervised forward pass"
