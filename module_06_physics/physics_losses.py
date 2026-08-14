@@ -5,6 +5,7 @@ Implements differentiable physics regularizers using LatentPhysicsHead:
 2. Bounded Acceleration Regularizer (soft penalty on excessive da/dt)
 3. Energy & SNR Temporal Continuity Loss
 4. Supervised Physical Observable Alignment (optional when clean x is available)
+5. Gap-aware weighting to handle irregular sampling.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ class RadarPhysicsLoss(nn.Module):
         lambda_align: float = 0.5,
         a_ref: float = 5.0,
         tau: float = 1.0,
+        gap_alpha: float = 0.5,
         physics_head: Optional[LatentPhysicsHead] = None,
     ) -> None:
         super().__init__()
@@ -57,23 +59,62 @@ class RadarPhysicsLoss(nn.Module):
         self.lambda_align = float(lambda_align)
         self.a_ref = float(a_ref)
         self.tau = float(tau)
+        self.gap_alpha = float(gap_alpha)
 
         self.physics_head = physics_head if physics_head is not None else LatentPhysicsHead()
         self.raw_extractor = RadarObservableExtractor(temperature=temperature)
 
-    def compute_kinematic_loss(self, r_hat: torch.Tensor, v_hat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_gap_weights(self, mask: torch.Tensor) -> torch.Tensor:
+        """Compute transition weights inversely proportional to gap size."""
+        with torch.no_grad():
+            obs = mask[:, :, 0]
+            missing = 1.0 - obs
+            T = obs.shape[1]
+
+            left_run = torch.zeros_like(obs)
+            for t in range(T):
+                if t == 0:
+                    left_run[:, t] = missing[:, t]
+                else:
+                    left_run[:, t] = (left_run[:, t-1] + 1) * missing[:, t]
+
+            right_run = torch.zeros_like(obs)
+            for t in range(T-1, -1, -1):
+                if t == T-1:
+                    right_run[:, t] = missing[:, t]
+                else:
+                    right_run[:, t] = (right_run[:, t+1] + 1) * missing[:, t]
+
+            run_length = left_run + right_run - missing
+            gap_for_transition = torch.maximum(run_length[:, :-1], run_length[:, 1:])
+            w_gap = 1.0 / (1.0 + self.gap_alpha * gap_for_transition)
+            w_gap = torch.clamp(w_gap, min=1e-6, max=1.0)
+            return w_gap
+
+    def compute_kinematic_loss(
+        self, r_hat: torch.Tensor, v_hat: torch.Tensor, gap_weights: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute range-rate vs. radial velocity kinematic consistency loss."""
         dr_dt = (r_hat[:, 1:] - r_hat[:, :-1]) / self.dt
         v_target = self.velocity_sign * v_hat[:, :-1]
         kin_residual = dr_dt - v_target
-        loss = F.smooth_l1_loss(dr_dt, v_target, beta=1.0)
+        if gap_weights is None:
+            loss = F.smooth_l1_loss(dr_dt, v_target, beta=1.0)
+        else:
+            per_element_loss = F.smooth_l1_loss(dr_dt, v_target, beta=1.0, reduction='none')
+            loss = torch.sum(gap_weights * per_element_loss) / torch.sum(gap_weights).clamp(min=1e-8)
         return loss, kin_residual
 
-    def compute_acceleration_loss(self, v_hat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_acceleration_loss(
+        self, v_hat: torch.Tensor, gap_weights: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute soft bounded acceleration loss."""
         a_t = (v_hat[:, 1:] - v_hat[:, :-1]) / self.dt
         acc_penalty = F.softplus((torch.abs(a_t) - self.a_ref) / self.tau)
-        loss = torch.mean(acc_penalty)
+        if gap_weights is None:
+            loss = torch.mean(acc_penalty)
+        else:
+            loss = torch.sum(gap_weights * acc_penalty) / torch.sum(gap_weights).clamp(min=1e-8)
         return loss, a_t
 
     def compute_energy_loss(self, energy: torch.Tensor) -> torch.Tensor:
@@ -102,8 +143,12 @@ class RadarPhysicsLoss(nn.Module):
         v_hat = obs["velocity"]
         e_hat = obs["energy"]
 
-        l_kin, kin_res = self.compute_kinematic_loss(r_hat, v_hat)
-        l_acc, acc_t = self.compute_acceleration_loss(v_hat)
+        gap_weights = None
+        if mask is not None and self.gap_alpha > 0:
+            gap_weights = self.compute_gap_weights(mask)
+
+        l_kin, kin_res = self.compute_kinematic_loss(r_hat, v_hat, gap_weights)
+        l_acc, acc_t = self.compute_acceleration_loss(v_hat, gap_weights)
         l_energy = self.compute_energy_loss(e_hat)
 
         total_loss = (
@@ -134,5 +179,8 @@ class RadarPhysicsLoss(nn.Module):
             "kin_residual": kin_res,
             "acceleration": acc_t,
         }
+
+        if gap_weights is not None:
+            components["gap_weights"] = gap_weights
 
         return total_loss, components
